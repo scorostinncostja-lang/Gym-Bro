@@ -1,0 +1,6 @@
+aiogram<4,>=3.13
+aiosqlite>=0.20
+apscheduler<4,>=3.10
+google-genai>=1.0
+groq>=0.13
+pydantic-settings>=2.4

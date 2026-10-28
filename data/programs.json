@@ -1,0 +1,78 @@
+{
+  "_comment": "Шаблоны дней. p — паттерн движения, fb — запасные паттерны, если под инвентарь ничего нет. Ротация по кругу: при 2-3 днях в неделю A→B→A→B...",
+  "splits": {
+    "2": "fullbody",
+    "3": "fullbody",
+    "4": "upper_lower"
+  },
+  "templates": {
+    "fullbody": [
+      {"name": "Всё тело A", "slots": [
+        {"p": "squat", "sets": 3},
+        {"p": "push_h", "sets": 3},
+        {"p": "pull_v", "fb": ["pull_h"], "sets": 3},
+        {"p": "hinge", "fb": ["glute"], "sets": 2},
+        {"p": "lateral", "sets": 2},
+        {"p": "core", "sets": 3}
+      ]},
+      {"name": "Всё тело B", "slots": [
+        {"p": "lunge", "sets": 3},
+        {"p": "push_v", "fb": ["push_h_easy"], "sets": 3},
+        {"p": "pull_h", "sets": 3},
+        {"p": "leg_curl", "fb": ["glute", "glute_hard"], "sets": 2},
+        {"p": "biceps", "sets": 2},
+        {"p": "core_alt", "sets": 2}
+      ]}
+    ],
+    "upper_lower": [
+      {"name": "Верх 1", "slots": [
+        {"p": "push_h", "sets": 3},
+        {"p": "pull_v", "fb": ["pull_h"], "sets": 3},
+        {"p": "push_v", "fb": ["push_h_easy"], "sets": 2},
+        {"p": "rear_delt", "sets": 2},
+        {"p": "triceps", "sets": 2},
+        {"p": "core", "sets": 2}
+      ]},
+      {"name": "Низ 1", "slots": [
+        {"p": "squat", "sets": 3},
+        {"p": "hinge", "fb": ["glute"], "sets": 3},
+        {"p": "leg_curl", "fb": ["glute_hard"], "sets": 2},
+        {"p": "calves", "sets": 3},
+        {"p": "core_alt", "sets": 2}
+      ]},
+      {"name": "Верх 2", "slots": [
+        {"p": "pull_h", "sets": 3},
+        {"p": "push_v", "fb": ["push_h"], "sets": 3},
+        {"p": "chest_fly", "fb": ["push_h_easy"], "sets": 2},
+        {"p": "biceps", "sets": 2},
+        {"p": "lateral", "sets": 2},
+        {"p": "triceps", "sets": 2}
+      ]},
+      {"name": "Низ 2", "slots": [
+        {"p": "lunge", "sets": 3},
+        {"p": "leg_ext", "fb": ["glute"], "sets": 2},
+        {"p": "glute", "fb": ["glute_hard"], "sets": 3},
+        {"p": "calves", "sets": 3},
+        {"p": "core_side", "fb": ["core"], "sets": 2}
+      ]}
+    ]
+  },
+  "families": [
+    ["squat"],
+    ["hinge", "glute", "glute_hard"],
+    ["lunge"],
+    ["push_h", "push_h_easy"],
+    ["push_v"],
+    ["pull_v", "pull_h"],
+    ["biceps", "biceps_alt"],
+    ["triceps"],
+    ["lateral"],
+    ["rear_delt"],
+    ["leg_curl"],
+    ["leg_ext"],
+    ["calves"],
+    ["core", "core_alt", "core_side"],
+    ["chest_fly"]
+  ],
+  "default_ranges": {"weight": [8, 12], "reps": [10, 20], "time": [20, 60]}
+}
