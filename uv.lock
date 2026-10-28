@@ -710,6 +710,7 @@ dependencies = [
     { name = "google-genai" },
     { name = "groq" },
     { name = "pydantic-settings" },
+    { name = "tzdata" },
 ]
 
 [package.dev-dependencies]
@@ -726,6 +727,7 @@ requires-dist = [
     { name = "google-genai", specifier = ">=1.0" },
     { name = "groq", specifier = ">=0.13" },
     { name = "pydantic-settings", specifier = ">=2.4" },
+    { name = "tzdata" },
 ]
 
 [package.metadata.requires-dev]

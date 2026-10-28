@@ -9,3 +9,4 @@ Requires-Dist: apscheduler<4,>=3.10
 Requires-Dist: google-genai>=1.0
 Requires-Dist: groq>=0.13
 Requires-Dist: pydantic-settings>=2.4
+Requires-Dist: tzdata
