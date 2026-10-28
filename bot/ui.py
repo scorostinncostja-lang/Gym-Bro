@@ -78,3 +78,8 @@ def fmt_num(x: float | None) -> str:
     if x is None:
         return "—"
     return str(int(x)) if float(x).is_integer() else f"{x:g}"
+
+
+class Ex(CallbackData, prefix="ex"):
+    act: str  # steps | db | part
+    id: str

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.filters import BaseFilter, Command
-from aiogram.types import CallbackQuery, InputMediaPhoto, Message
+from aiogram.types import CallbackQuery, Message
 
 from bot.data import PLACES, get_exercise
 from bot.db.database import Database
@@ -16,8 +16,9 @@ from bot.services.reminders import Reminders
 from bot.services.set_parser import ParsedSet, detect_feel, parse_set
 from bot.services.timeutil import WEEKDAYS_RU, local_today, next_training, parse_days
 from bot.services.workout import SetOutcome, WorkoutService, describe_item
+from bot.cards import send_exercise_media
 from bot.config import Settings
-from bot.ui import BTN_TODAY, Fl, MENU_BUTTONS, Rem, Wk, fmt_num, inline
+from bot.ui import BTN_TODAY, Ex, Fl, MENU_BUTTONS, Rem, Wk, fmt_num, inline
 
 log = logging.getLogger(__name__)
 
@@ -52,10 +53,7 @@ async def show_exercise(msg: Message, w: dict, workouts: WorkoutService, with_me
     assert ex
     target, last = await workouts.target_for(w["tg_id"], item, w["id"])
     if with_media:
-        try:
-            await msg.answer_media_group([InputMediaPhoto(media=u) for u in ex.images])
-        except Exception as e:  # noqa: BLE001 — картинки не критичны
-            log.info("не удалось отправить картинки %s: %r", ex.id, e)
+        await send_exercise_media(msg, ex, workouts.edb)
     unit = {"weight": "повт.", "reps": "повт.", "time": "сек"}[item["kind"]]
     lines = [
         f"<b>{w['ex_i'] + 1}/{len(w['plan'])} · {html.escape(ex.name)}</b>",
@@ -69,7 +67,7 @@ async def show_exercise(msg: Message, w: dict, workouts: WorkoutService, with_me
     await msg.answer(
         "\n".join(lines),
         reply_markup=inline([
-            [("📹 Видео-разбор", ex.video_url)],
+            [("📖 Подробно", Ex(act="steps", id=ex.id)), ("📹 YouTube", ex.video_url)],
             [("🔄 Заменить", Wk(act="swap", wid=w["id"])), ("⏭ Пропустить", Wk(act="skipex", wid=w["id"]))],
             [("🏁 Закончить тренировку", Wk(act="finish", wid=w["id"]))],
         ]),

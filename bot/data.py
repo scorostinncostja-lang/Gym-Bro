@@ -4,10 +4,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from urllib.parse import quote_plus
 
+from bot import sources
 from bot.config import DATA_DIR
-
-# Картинки старт/конец движения: free-exercise-db (Unlicense / public domain).
-IMAGE_BASE = "https://raw.githubusercontent.com/yuhonas/free-exercise-db/main/exercises"
 
 PLACES = {
     "gym": "🏋️ Зал",
@@ -34,12 +32,14 @@ class Exercise:
     kind: str  # weight | reps | time
     step: float
     fedb: str
+    hasan: str | None
     cues: tuple[str, ...]
     range: tuple[int, int]
 
     @property
     def images(self) -> list[str]:
-        return [f"{IMAGE_BASE}/{self.fedb}/{i}.jpg" for i in (0, 1)]
+        """Запасные картинки (старт/финиш), если нет GIF из hasaneyldrm."""
+        return sources.fedb_image_urls(self.fedb)
 
     @property
     def video_url(self) -> str:
@@ -61,7 +61,7 @@ def exercises() -> dict[str, Exercise]:
         rng = tuple(e.get("range") or ranges[e["kind"]])
         out[e["id"]] = Exercise(
             id=e["id"], name=e["name"], pattern=e["pattern"], equip=e["equip"],
-            kind=e["kind"], step=float(e["step"]), fedb=e["fedb"],
+            kind=e["kind"], step=float(e["step"]), fedb=e["fedb"], hasan=e.get("hasan"),
             cues=tuple(e["cues"]), range=rng,  # type: ignore[arg-type]
         )
     return out

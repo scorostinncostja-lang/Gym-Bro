@@ -5,17 +5,22 @@ from datetime import timedelta
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, InputMediaPhoto, Message
+from urllib.parse import quote_plus
 
+from aiogram.types import CallbackQuery, Message
+
+from bot.cards import send_animation, send_exercise_media, steps_text
 from bot.data import PLACES, find_exercises, get_exercise
 from bot.db.database import Database
 from bot.handlers.onboarding import GOALS, MEASURE_LABELS, MEASURE_UNITS
-from bot.services.program_builder import build_day
 from bot.data import program_templates
+from bot.services.exercise_db import ExerciseDB
+from bot.services.program_builder import build_day
 from bot.services.reminders import Reminders
 from bot.services.timeutil import WEEKDAYS_RU, fmt_days, local_today, next_training, parse_days
 from bot.services.workout import describe_item
-from bot.ui import BTN_PLAN, BTN_SETTINGS, BTN_STATS, St, inline, main_menu
+from bot.sources import ATTRIBUTION
+from bot.ui import BTN_PLAN, BTN_SETTINGS, BTN_STATS, Ex, St, inline
 
 router = Router()
 router.message.filter(F.chat.type == "private")
@@ -27,13 +32,16 @@ HELP = """\
 📊 /stats — прогресс, серия, рабочие веса
 📏 /measure — новые замеры
 💊 /supplements — что работает, а что маркетинг
-🔎 /exercise присед — техника и картинки упражнения
+🔎 /exercise присед — анимация и техника (русский или английский)
+📚 /library — каталог упражнений по группам мышц
 ⚙️ /settings — место, расписание, часовой пояс
 🔒 /privacy — какие данные я храню
 🗑 /delete_me — удалить все данные
 
 Во время тренировки пиши подходы текстом («40 10 тяжело») или голосом. Любые вопросы по технике и \
-восстановлению — просто напиши. Фото еды и видео техники тоже принимаю."""
+восстановлению — просто напиши. Фото еды и видео техники тоже принимаю.
+
+""" + ATTRIBUTION + "."
 
 PRIVACY = """\
 <b>Что хранится</b>
@@ -127,29 +135,126 @@ async def cmd_stats(message: Message, db: Database):
     await message.answer("\n".join(lines))
 
 
-# ---------- /exercise ----------
+# ---------- /exercise, /library ----------
+PARTS_RU = {
+    "chest": "Грудь", "back": "Спина", "shoulders": "Плечи", "upper arms": "Бицепс и трицепс",
+    "lower arms": "Предплечья", "upper legs": "Бёдра и ягодицы", "lower legs": "Голени",
+    "waist": "Пресс и корпус", "neck": "Шея", "cardio": "Кардио",
+}
+
+
+def _ex_buttons(curated, found) -> list[list[tuple[str, Ex]]]:
+    rows = [[(f"⭐ {e.name}", Ex(act="cur", id=e.id))] for e in curated[:6]]
+    rows += [[(e.name, Ex(act="db", id=e.id))] for e in found[:12]]
+    return rows
+
+
+async def send_curated(msg: Message, ex, edb: ExerciseDB) -> None:
+    await send_exercise_media(msg, ex, edb)
+    has_steps = bool(edb.get(ex.hasan) and edb.get(ex.hasan).steps_ru)  # type: ignore[union-attr]
+    row = ([("📖 Подробно", Ex(act="steps", id=ex.id))] if has_steps else []) + [("📹 YouTube", ex.video_url)]
+    await msg.answer(
+        f"<b>{html.escape(ex.name)}</b>\n" + "\n".join(f"• {html.escape(c)}" for c in ex.cues),
+        reply_markup=inline([row]),
+    )
+
+
+async def send_db_item(msg: Message, item, edb: ExerciseDB) -> None:
+    gif = edb.gif_url(item.id)
+    if gif:
+        await send_animation(msg, gif)
+    q = quote_plus(f"{item.name} exercise form")
+    await msg.answer(
+        steps_text(item.name, item),
+        reply_markup=inline([[("📹 YouTube", f"https://www.youtube.com/results?search_query={q}")]]),
+    )
+
+
 @router.message(Command("exercise"))
-async def cmd_exercise(message: Message, command: CommandObject):
+async def cmd_exercise(message: Message, command: CommandObject, edb: ExerciseDB):
     query = (command.args or "").strip()
     if len(query) < 3:
-        await message.answer("Напиши часть названия, например: <code>/exercise присед</code> или <code>/exercise жим</code>.")
+        await message.answer(
+            "Напиши часть названия: <code>/exercise присед</code> или по-английски "
+            "<code>/exercise lat pulldown</code>. Каталог по мышцам: /library"
+        )
         return
-    found = find_exercises(query)
-    if not found:
-        await message.answer("Такого упражнения нет в моей базе. Попробуй другое слово: присед, жим, тяга, планка.")
+    curated = find_exercises(query)
+    found = edb.search(query) if edb.ready else []
+    curated_hw = {e.hasan for e in curated}
+    found = [e for e in found if e.id not in curated_hw]
+    if not curated and not found:
+        await message.answer("Не нашёл. Попробуй другое слово: присед, жим, тяга, планка, squat, curl.")
         return
-    if len(found) > 1:
-        await message.answer("Нашёл несколько, уточни:\n" + "\n".join(f"• {html.escape(e.name)}" for e in found[:15]))
+    if len(curated) == 1 and not found:
+        await send_curated(message, curated[0], edb)
         return
-    ex = found[0]
-    try:
-        await message.answer_media_group([InputMediaPhoto(media=u) for u in ex.images])
-    except Exception:  # noqa: BLE001
-        pass
     await message.answer(
-        f"<b>{html.escape(ex.name)}</b>\n" + "\n".join(f"• {html.escape(c)}" for c in ex.cues),
-        reply_markup=inline([[("📹 Видео-разбор", ex.video_url)]]),
+        "Нашёл, выбери (⭐ — из моей программы):", reply_markup=inline(_ex_buttons(curated, found))
     )
+
+
+@router.message(Command("library"))
+async def cmd_library(message: Message, edb: ExerciseDB):
+    if not edb.ready:
+        await message.answer("База упражнений сейчас недоступна. Попробуй позже. Основные упражнения: /exercise присед")
+        return
+    rows = [[(PARTS_RU.get(p, p), Ex(act="part", id=p))] for p in edb.parts() if p != "cardio"]
+    await message.answer(
+        f"📚 <b>Каталог: {len(edb.items)} упражнений</b> с анимацией и инструкцией на русском. "
+        "Выбери группу мышц. Названия в каталоге английские, шаги на русском.",
+        reply_markup=inline(rows),
+    )
+
+
+@router.callback_query(Ex.filter(F.act == "part"))
+async def on_part(cb: CallbackQuery, callback_data: Ex, edb: ExerciseDB):
+    await cb.answer()
+    items = edb.by_part(callback_data.id, 20)
+    rows = [[(e.name, Ex(act="db", id=e.id))] for e in items]
+    rows.append([("◀ Группы мышц", Ex(act="parts", id=""))])
+    await cb.message.edit_text(
+        f"<b>{PARTS_RU.get(callback_data.id, callback_data.id)}</b>: самые простые варианты. "
+        "Больше — через поиск: <code>/exercise curl</code>.",
+        reply_markup=inline(rows),
+    )
+
+
+@router.callback_query(Ex.filter(F.act == "parts"))
+async def on_parts(cb: CallbackQuery, edb: ExerciseDB):
+    await cb.answer()
+    rows = [[(PARTS_RU.get(p, p), Ex(act="part", id=p))] for p in edb.parts() if p != "cardio"]
+    await cb.message.edit_text("📚 <b>Каталог упражнений.</b> Выбери группу мышц.", reply_markup=inline(rows))
+
+
+@router.callback_query(Ex.filter(F.act == "db"))
+async def on_db_item(cb: CallbackQuery, callback_data: Ex, edb: ExerciseDB):
+    item = edb.get(callback_data.id)
+    if not item:
+        await cb.answer("Не нашёл.", show_alert=True)
+        return
+    await cb.answer()
+    await send_db_item(cb.message, item, edb)
+
+
+@router.callback_query(Ex.filter(F.act == "cur"))
+async def on_curated(cb: CallbackQuery, callback_data: Ex, edb: ExerciseDB):
+    ex = get_exercise(callback_data.id)
+    if not ex:
+        await cb.answer("Не нашёл.", show_alert=True)
+        return
+    await cb.answer()
+    await send_curated(cb.message, ex, edb)
+
+
+@router.callback_query(Ex.filter(F.act == "steps"))
+async def on_steps(cb: CallbackQuery, callback_data: Ex, edb: ExerciseDB):
+    ex = get_exercise(callback_data.id)
+    if not ex:
+        await cb.answer("Не нашёл.", show_alert=True)
+        return
+    await cb.answer()
+    await cb.message.answer(steps_text(ex.name, edb.get(ex.hasan)))
 
 
 # ---------- /settings ----------

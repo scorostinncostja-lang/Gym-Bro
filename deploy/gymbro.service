@@ -1,0 +1,20 @@
+# Установка: sudo cp deploy/gymbro.service /etc/systemd/system/ && sudo systemctl enable --now gymbro
+# Поправь User и пути под свой сервер.
+[Unit]
+Description=Gym Bro Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gymbro
+WorkingDirectory=/opt/gym-bro
+ExecStart=/opt/gym-bro/.venv/bin/python -m bot
+Restart=always
+RestartSec=5
+# Токены читаются из /opt/gym-bro/.env (chmod 600)
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/opt/gym-bro/var
+
+[Install]
+WantedBy=multi-user.target

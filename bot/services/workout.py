@@ -4,6 +4,7 @@ from datetime import date
 
 from bot.data import get_exercise
 from bot.db.database import Database
+from bot.services.exercise_db import ExerciseDB
 from bot.services.program_builder import alternatives, build_day, template_for
 from bot.services.progression import Feel, SetResult, Target, next_target, set_hint
 from bot.services.set_parser import ParsedSet
@@ -16,8 +17,9 @@ class SetOutcome:
 
 
 class WorkoutService:
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, edb: ExerciseDB):
         self.db = db
+        self.edb = edb
 
     async def ensure_planned(self, user: dict, day: date) -> dict:
         """План на день: берём существующий или собираем по шаблону."""
