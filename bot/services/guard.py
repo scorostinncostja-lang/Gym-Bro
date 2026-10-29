@@ -1,13 +1,11 @@
 """Жёсткие правила безопасности в коде, до обращения к ИИ.
 
 LLM нельзя доверять в вопросах про подростков, добавки и еду: ответ даёт
-код, а не модель. Подросткам дозы только из справочника (supp_advice),
-стимуляторы, диеты и стероиды закрыты.
+код, а не модель. Стимуляторы и диеты подросткам, стероиды всем закрыты.
+Дозы добавок считает supp_plan.
 """
 import re
 from dataclasses import dataclass
-
-from bot.services.supp_advice import dose_reply
 
 MINOR_AGE = 18
 
@@ -20,11 +18,6 @@ class GuardHit:
 
 _DRUGS = re.compile(
     r"стероид|анаболик|\bсарм|\bsarm|прогормон|кленбутерол|эфедрин|оксандролон|тестостерон\s+(?:курс|колоть)|\bкурс\s+(?:стероид|анаболик)",
-    re.I,
-)
-_SUPP_WORDS = r"креатин|протеин|изолят|омега|bcaa|бцаа|аминокислот|добавк|витамин|кофеин|энергетик|предтрен|пре-?воркаут|гейнер|жиросжигат|тестобуст"
-_DOSE_INTENT = re.compile(
-    rf"(?:доз|сколько|как\s+(?:принимать|пить|употреблять)|когда\s+(?:принимать|пить)).*(?:{_SUPP_WORDS})|(?:{_SUPP_WORDS}).*(?:доз|сколько|как\s+(?:принимать|пить)|когда\s+(?:принимать|пить))",
     re.I,
 )
 _STIMULANT = re.compile(r"жиросжигат|предтрен|пре-?воркаут|тестобуст|энергетик", re.I)
@@ -75,8 +68,6 @@ def check(text: str, age: int | None) -> GuardHit | None:
     if is_minor:
         if _STIMULANT.search(text):
             return GuardHit("minor_stimulant", MINOR_STIM_REPLY)
-        if _DOSE_INTENT.search(text):
-            return GuardHit("minor_supp_dose", dose_reply(text))
         if _DIET.search(text):
             return GuardHit("minor_diet", MINOR_DIET_REPLY)
     return None

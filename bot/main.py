@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from bot.config import get_settings
 from bot.db.database import Database
+from bot.middlewares import DoubleTapMiddleware, UserSerialMiddleware
 from bot.handlers import chat, info, onboarding, progress, supplements, workout
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
@@ -72,8 +73,12 @@ def build_dispatcher(*, settings, db, edb, llm, workouts, reminders) -> Dispatch
         workouts=workouts, reminders=reminders,
     )
     access = AccessMiddleware(settings.allowed_user_ids)
+    serial = UserSerialMiddleware()
     dp.message.outer_middleware(access)
     dp.callback_query.outer_middleware(access)
+    dp.message.outer_middleware(serial)
+    dp.callback_query.outer_middleware(serial)
+    dp.callback_query.outer_middleware(DoubleTapMiddleware())
     dp.errors.register(on_error)
     # Порядок важен: ИИ-чат с «ловит всё» идёт последним.
     for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router):
@@ -81,9 +86,21 @@ def build_dispatcher(*, settings, db, edb, llm, workouts, reminders) -> Dispatch
     return dp
 
 
+# Шумные библиотеки: на каждый апдейт и запрос пишут INFO, журнал на сервере раздувается.
+_NOISY = ("httpx", "httpcore", "aiogram.event", "aiogram.dispatcher", "apscheduler", "google_genai",
+          "google.genai", "urllib3", "aiohttp", "groq")
+
+
+def setup_logging(level: str) -> None:
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(level=lvl, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    for name in _NOISY:
+        logging.getLogger(name).setLevel(max(lvl, logging.WARNING))
+
+
 async def run() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = get_settings()
+    setup_logging(settings.log_level)
 
     bot = Bot(settings.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     db = Database(settings.db_path)

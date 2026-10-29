@@ -83,3 +83,16 @@ def fmt_num(x: float | None) -> str:
 class Ex(CallbackData, prefix="ex"):
     act: str  # steps | db | part
     id: str
+
+
+def workout_keyboard(wid: int, places: list[str], current: str, reminder: bool = False):
+    """Кнопки тренировки: начать в текущем месте, переключиться на другое, отложить или пропустить."""
+    from bot.services.places import NAME, SHORT
+
+    rows = [[(f"✅ Начать · {NAME[current]}", Rem(act="go", wid=wid))]]
+    alts = [p for p in places if p != current]
+    if alts:
+        rows.append([(SHORT[p], Rem(act=f"p_{p}", wid=wid)) for p in alts])
+    if reminder:
+        rows.append([("⏰ Через 30 мин", Rem(act="snooze", wid=wid)), ("❌ Пропуск", Rem(act="skip", wid=wid))])
+    return inline(rows)

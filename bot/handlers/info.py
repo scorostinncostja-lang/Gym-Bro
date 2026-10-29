@@ -10,11 +10,12 @@ from urllib.parse import quote_plus
 from aiogram.types import CallbackQuery, Message
 
 from bot.cards import send_animation, send_exercise_media, steps_text
-from bot.data import PLACES, find_exercises, get_exercise
+from bot.data import find_exercises, get_exercise
 from bot.db.database import Database
 from bot.handlers.onboarding import GOALS, MEASURE_LABELS, MEASURE_UNITS
 from bot.data import program_templates
 from bot.services.exercise_db import ExerciseDB
+from bot.services.places import places_label, user_places
 from bot.services.program_builder import build_day
 from bot.services.reminders import Reminders
 from bot.services.timeutil import WEEKDAYS_RU, fmt_days, local_today, next_training, parse_days
@@ -27,20 +28,27 @@ router.message.filter(F.chat.type == "private")
 
 HELP = """\
 <b>Что я умею</b>
-🏋️ /today — тренировка сегодня (в зале или дома)
+🏋️ /today — тренировка сегодня: в зале или дома, место меняется кнопкой
 📅 /plan — твоя программа
 📊 /stats — прогресс, серия, рабочие веса
-📏 /measure — новые замеры: лента, фото или кружок
+📏 /measure — замеры: лента, фото или кружок
 📸 /progress — фото «было → стало», /photo_guide — как снимать
-💊 /supplements — что работает, а что маркетинг
+💊 /supplements — отметь, что у тебя есть, посчитаю дозы по твоему весу
 🔎 /exercise присед — анимация и техника (русский или английский)
 📚 /library — каталог упражнений по группам мышц
-⚙️ /settings — место, расписание, часовой пояс
+⚙️ /settings — места, расписание, часовой пояс
 🔒 /privacy — какие данные я храню
 🗑 /delete_me — удалить все данные
 
-Во время тренировки пиши подходы текстом («40 10 тяжело») или голосом. Любые вопросы по технике и \
-восстановлению — просто напиши. Фото еды и видео техники тоже принимаю.
+<b>Как тренироваться</b>
+Я говорю, какой вес взять. Делаешь подход и пишешь «вес повторы», например <code>20 10</code>, или \
+говоришь голосом. Потом словами или кнопкой, как далось: «легко», «нормально», «тяжело», «на пределе». \
+Вес я подстраиваю сам. Боль в суставе или спине — стоп.
+
+<b>Можно просто написать</b>
+• «напоминай в 19:30» или «тренируюсь по пн, ср, пт» — поменяю расписание
+• «у меня есть креатин и протеин» — посчитаю план приёма
+• любой вопрос по технике, питанию и восстановлению; фото еды и видео техники тоже принимаю
 
 """ + ATTRIBUTION + "."
 
@@ -85,7 +93,7 @@ async def cmd_plan(message: Message, db: Database):
     nxt = next_training(days, user["train_time"], user["tz"])
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
     await message.answer(
-        f"{PLACES[user['place']]} · {fmt_days(days)} в {user['train_time']}\n"
+        f"{places_label(user_places(user))} · {fmt_days(days)} в {user['train_time']}\n"
         f"Ближайшая тренировка: {when}\n\n" + "\n\n".join(blocks)
         + "\n\nДни чередуются по кругу. Веса подбираются автоматически по твоим результатам."
     )
@@ -270,7 +278,7 @@ async def cmd_settings(message: Message, db: Database):
     await message.answer(
         "⚙️ <b>Настройки</b>\n"
         f"Цель: {GOALS.get(user['goal'], '—')}\n"
-        f"Место: {PLACES[user['place']]}\n"
+        f"Места: {places_label(user_places(user))}\n"
         f"Расписание: {fmt_days(parse_days(user['days']))} в {user['train_time']}\n"
         f"Часовой пояс: {user['tz']}",
         reply_markup=inline([
@@ -279,22 +287,6 @@ async def cmd_settings(message: Message, db: Database):
             [("🗑 Удалить мои данные", St(act="del"))],
         ]),
     )
-
-
-@router.callback_query(St.filter(F.act == "place"))
-async def settings_place(cb: CallbackQuery):
-    await cb.answer()
-    await cb.message.edit_reply_markup(reply_markup=inline(
-        [[(v, St(act="setplace", arg=k))] for k, v in PLACES.items()]
-    ))
-
-
-@router.callback_query(St.filter(F.act == "setplace"))
-async def settings_setplace(cb: CallbackQuery, callback_data: St, db: Database):
-    await cb.answer()
-    await db.update_user(cb.from_user.id, place=callback_data.arg)
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await cb.message.answer(f"Место: {PLACES[callback_data.arg]}. Новые тренировки уже под него. Смотри: /plan")
 
 
 @router.callback_query(St.filter(F.act == "del"))

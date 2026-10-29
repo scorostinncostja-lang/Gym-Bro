@@ -4,23 +4,37 @@ import base64
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 
 from google import genai
 from google.genai import types
-from groq import AsyncGroq
+from groq import AsyncGroq, NotFoundError
 
-from bot.config import Settings
-from bot.prompts import SET_EXTRACT_PROMPT
+from bot.config import DEFAULT_GROQ_LLM, DEFAULT_GROQ_VISION, Settings
+from bot.prompts import FEEL_EXTRACT_PROMPT, SET_EXTRACT_PROMPT
+from bot.services.progression import Feel
 
 log = logging.getLogger(__name__)
 
-TIMEOUT = 45
+TIMEOUT = 30  # Groq и одиночные вызовы
+GEMINI_TIMEOUT = 15  # на модель: перегруженная модель отвечает долго, лучше быстро уйти на запасную
+COOLDOWN = 120  # после сбоя модель на столько секунд выпадает из очереди
 GEMINI_THINKING_HEADROOM = 1024
+GROQ_THINKING_HEADROOM = 1024
+RETRY_DELAYS = (1.5,)  # повтор после 503/429 на основной модели Gemini
 
 
 class LLMError(RuntimeError):
     """Ни один провайдер не смог ответить."""
+
+
+def _transient(e: Exception) -> bool:
+    """Временный сбой: перегрузка, лимит, таймаут. Стоит повторить или уйти на запасной вариант."""
+    text = repr(e)
+    return isinstance(e, asyncio.TimeoutError) or any(
+        k in text for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded", "Timeout")
+    )
 
 
 @dataclass(frozen=True)
@@ -38,6 +52,7 @@ class LLM:
         self.s = settings
         self.gemini = genai.Client(api_key=settings.gemini_api_key) if settings.gemini_api_key else None
         self.groq = AsyncGroq(api_key=settings.groq_api_key) if settings.groq_api_key else None
+        self._bad_until: dict[str, float] = {}
 
     @property
     def available(self) -> bool:
@@ -52,15 +67,33 @@ class LLM:
         max_tokens: int = 700,
         temperature: float = 0.6,
     ) -> str:
+        """Gemini (с повтором и запасной моделью), затем Groq."""
         errors: list[str] = []
         if self.gemini:
-            try:
-                return await asyncio.wait_for(
-                    self._gemini(system, history, user_text, media, max_tokens, temperature), TIMEOUT
-                )
-            except Exception as e:  # noqa: BLE001 — любой сбой провайдера = пробуем запасной
-                log.warning("Gemini failed: %r", e)
-                errors.append(f"gemini: {e!r}")
+            models = [self.s.gemini_model]
+            if self.s.gemini_fallback_model and self.s.gemini_fallback_model not in models:
+                models.append(self.s.gemini_fallback_model)
+            now = time.monotonic()
+            # Модели, которые только что падали, пропускаем; если упали все, пробуем по порядку.
+            live = [m for m in models if self._bad_until.get(m, 0) <= now] or models
+            for n, model in enumerate(live):
+                delays = RETRY_DELAYS if n == 0 and len(live) > 1 else ()
+                for attempt in range(len(delays) + 1):
+                    try:
+                        return await asyncio.wait_for(
+                            self._gemini(model, system, history, user_text, media, max_tokens), GEMINI_TIMEOUT
+                        )
+                    except Exception as e:  # noqa: BLE001 — любой сбой провайдера = пробуем дальше
+                        log.warning("Gemini %s: %r", model, e)
+                        errors.append(f"{model}: {e!r}")
+                        if _transient(e):
+                            self._bad_until[model] = time.monotonic() + COOLDOWN
+                            if isinstance(e, asyncio.TimeoutError):
+                                break  # таймаут = перегрузка, сразу следующая модель
+                            if attempt < len(delays):
+                                await asyncio.sleep(delays[attempt])
+                                continue
+                        break
         if self.groq and not (media and media.is_video):
             try:
                 return await asyncio.wait_for(
@@ -71,7 +104,7 @@ class LLM:
                 errors.append(f"groq: {e!r}")
         raise LLMError("; ".join(errors) or "нет настроенных провайдеров")
 
-    async def _gemini(self, system, history, user_text, media, max_tokens, temperature) -> str:
+    async def _gemini(self, model, system, history, user_text, media, max_tokens) -> str:
         assert self.gemini
         contents = [
             types.Content(
@@ -85,9 +118,9 @@ class LLM:
             parts.insert(0, types.Part.from_bytes(data=media.data, mime_type=media.mime))
         contents.append(types.Content(role="user", parts=parts))
         # У Gemini 3.x токены «размышления» входят в max_output_tokens: без запаса ответ обрезается
-        # или приходит пустым. Температуру не передаём: для 3.8 sampling-параметры устарели.
+        # или приходит пустым. Температуру не передаём: для 3.x sampling-параметры устарели.
         resp = await self.gemini.aio.models.generate_content(
-            model=self.s.gemini_model,
+            model=model,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system,
@@ -112,18 +145,43 @@ class LLM:
                 {"type": "text", "text": user_text},
                 {"type": "image_url", "image_url": {"url": f"data:{media.mime};base64,{b64}"}},
             ]
-            model = self.s.groq_vision_model
+            models = [self.s.groq_vision_model, DEFAULT_GROQ_VISION]
         else:
             content = user_text
-            model = self.s.groq_llm_model
+            models = [self.s.groq_llm_model, DEFAULT_GROQ_LLM]
         messages.append({"role": "user", "content": content})
-        resp = await self.groq.chat.completions.create(
-            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
-        )
-        text = (resp.choices[0].message.content or "").strip()
-        if not text:
-            raise LLMError("пустой ответ Groq")
-        return text
+        last: Exception | None = None
+        for model in dict.fromkeys(models):  # без повторов, порядок сохраняется
+            kwargs: dict = {"max_tokens": max_tokens + GROQ_THINKING_HEADROOM, "temperature": temperature}
+            if model.startswith("openai/gpt-oss"):
+                kwargs["reasoning_effort"] = "low"  # иначе «размышления» съедают лимит ответа
+            try:
+                resp = await self.groq.chat.completions.create(model=model, messages=messages, **kwargs)
+            except NotFoundError as e:  # модель убрана у провайдера: пробуем актуальную
+                log.warning("Groq: модели %s нет, пробую следующую", model)
+                last = e
+                continue
+            text = (resp.choices[0].message.content or "").strip()
+            if not text:
+                raise LLMError("пустой ответ Groq")
+            return text
+        raise LLMError(f"Groq: нет доступных моделей ({last!r})")
+
+    async def classify_feel(self, text: str) -> tuple[Feel | None, bool]:
+        """Свободный текст о подходе («еле дожал, колено ныло») в (самочувствие, есть ли боль)."""
+        try:
+            raw = await self.chat(FEEL_EXTRACT_PROMPT, [], text, max_tokens=60, temperature=0)
+        except LLMError:
+            return None, False
+        m = re.search(r"\{.*?\}", raw, re.S)
+        if not m:
+            return None, False
+        try:
+            data = json.loads(m.group(0))
+        except ValueError:
+            return None, False
+        feel = {"easy": Feel.EASY, "ok": Feel.OK, "hard": Feel.HARD, "max": Feel.MAX}.get(str(data.get("feel")))
+        return feel, bool(data.get("pain"))
 
     async def extract_set(self, text: str) -> tuple[float | None, int | None]:
         """Запасной разбор подхода, когда регулярки не справились (слова вместо цифр)."""

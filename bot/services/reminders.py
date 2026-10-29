@@ -9,25 +9,17 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
-from bot.data import supplements
 from bot.db.database import Database
-from bot.services.supp_advice import can_stack
+from bot.services.supp_plan import build_plan, daily_reminder_lines
 from bot.services.timeutil import local_today, parse_days
 from bot.services.workout import WorkoutService
-from bot.ui import Rem, inline
+from bot.services.places import user_places
+from bot.ui import workout_keyboard
 
 log = logging.getLogger(__name__)
 
 FOLLOWUP_MIN = 45
 SNOOZE_MIN = 30
-ADULT = 18  # от возраста зависят только дозы, а не само напоминание
-
-
-def reminder_keyboard(wid: int):
-    return inline([
-        [("✅ Иду", Rem(act="go", wid=wid)), ("🏠 Дома", Rem(act="home", wid=wid))],
-        [("⏰ Через 30 мин", Rem(act="snooze", wid=wid)), ("❌ Пропуск", Rem(act="skip", wid=wid))],
-    ])
 
 
 class Reminders:
@@ -96,8 +88,8 @@ class Reminders:
         await self._safe_send(
             tg_id,
             f"💪 Пора тренироваться: <b>{html.escape(w['day_name'])}</b>.{streak_line}\n"
-            "Ответь кнопкой. Нет сил на зал — выбери «Дома», подберу домашнюю версию.",
-            reminder_keyboard(w["id"]),
+            "Нажми «Начать» или выбери другое место: подберу версию под него.",
+            workout_keyboard(w["id"], user_places(user), w["place"], reminder=True),
         )
         self._schedule_followup(tg_id, w["id"])
 
@@ -120,26 +112,26 @@ class Reminders:
         if not w or w["status"] != "planned" or w["nagged"]:
             return
         await self.db.update_workout(workout_id, nagged=1)
+        user = await self.db.get_user(tg_id)
+        if not user:
+            return
         await self._safe_send(
             tg_id,
             "Ты не ответил. Тренировка в силе? Даже 15 минут лучше, чем ничего. "
             "Не вышло — нажми «Пропуск», я не обижусь.",
-            reminder_keyboard(workout_id),
+            workout_keyboard(workout_id, user_places(user), w["place"], reminder=True),
         )
 
     async def send_supp_reminder(self, tg_id: int) -> None:
         user = await self.db.get_user(tg_id)
         if not user:
             return
-        adult = (user.get("age") or 0) >= ADULT
-        sup = supplements()
-        stack = [s for s in await self.db.stack_list(tg_id) if s in sup and can_stack(sup[s], adult)]
-        if not stack:
+        plan = build_plan(user, await self.db.stack_list(tg_id))
+        lines = daily_reminder_lines(plan)
+        if not lines:
             return
-        names = ", ".join(sup[s]["name"] for s in stack)
-        await self._safe_send(
-            tg_id, f"💊 Твой набор на сегодня: {html.escape(names)}.\nДозы: /supplements → нужная добавка."
-        )
+        body = "\n".join(f"• {html.escape(x)}" for x in lines)
+        await self._safe_send(tg_id, f"💊 Добавки на сегодня:\n{body}\nПлан целиком: /stack")
 
     async def _safe_send(self, tg_id: int, text: str, markup=None) -> None:
         try:

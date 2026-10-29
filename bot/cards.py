@@ -35,6 +35,32 @@ async def send_exercise_media(msg: Message, ex: Exercise, edb: ExerciseDB) -> No
         log.info("картинки не отправились %s: %r", ex.id, e)
 
 
+CAPTION_LIMIT = 1024  # лимит Telegram на подпись к медиа
+
+
+async def send_exercise_card(msg: Message, ex: Exercise, edb: ExerciseDB, text: str, markup, with_media: bool = True) -> None:
+    """Карточка упражнения одним сообщением: GIF с подписью и кнопками. Нет GIF — картинки и текст."""
+    if with_media:
+        gif = edb.gif_url(ex.hasan)
+        if gif:
+            if len(text) <= CAPTION_LIMIT:
+                try:
+                    sent = await msg.answer_animation(_FILE_IDS.get(gif) or gif, caption=text, reply_markup=markup)
+                    if gif not in _FILE_IDS and sent.animation:
+                        _FILE_IDS[gif] = sent.animation.file_id
+                    return
+                except Exception as e:  # noqa: BLE001 — идём к запасным картинкам
+                    log.info("GIF с подписью не отправился %s: %r", gif, e)
+            elif await send_animation(msg, gif):
+                await msg.answer(text, reply_markup=markup)
+                return
+        try:
+            await msg.answer_media_group([InputMediaPhoto(media=u) for u in ex.images])
+        except Exception as e:  # noqa: BLE001
+            log.info("картинки не отправились %s: %r", ex.id, e)
+    await msg.answer(text, reply_markup=markup)
+
+
 def steps_text(title: str, item: DbExercise | None, empty: str = "Подробной инструкции в базе нет.") -> str:
     lines = [f"📖 <b>{html.escape(title)}</b>"]
     if item and item.steps_ru:

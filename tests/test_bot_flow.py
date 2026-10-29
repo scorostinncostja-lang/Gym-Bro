@@ -110,14 +110,16 @@ async def onboard(c: Chatter, age="15", method="tape"):
     await finish_onboarding(c)
 
 
-async def finish_onboarding(c: Chatter):
+async def finish_onboarding(c: Chatter, places=("gym",), time_text="18:00"):
     await c.press(Ob(act="goal", arg="muscle"))
     await c.press(Ob(act="level", arg="new"))
-    await c.press(Ob(act="place", arg="gym"))
+    for p in places:
+        await c.press(Ob(act="pl", arg=p))
+    await c.press(Ob(act="pldone"))
     await c.press(Ob(act="n", arg="3"))
     await c.press(Ob(act="dpreset"))
     await c.press(Ob(act="ddone"))
-    await c.press(Ob(act="t", arg="1800"))
+    await c.say(time_text)
     await c.press(Ob(act="tz", arg="4"))
 
 
@@ -164,9 +166,10 @@ async def test_workout_session_via_telegram(rig):
     assert w["pend_set_id"]
     await c.press(Fl(wid=w["id"], sid=w["pend_set_id"], v=1))
     w = await db.get_workout(w["id"])
-    assert w["set_i"] == 1 and w["cur_reps"] == 11  # «легко» -> на повтор больше
+    # первый заход, «легко»: стартовый вес был оценкой, поэтому сразу +шаг, а не +1 повтор
+    assert w["set_i"] == 1 and w["cur_weight"] == 45
     # ощущение прямо в тексте закрывает подход сразу
-    await c.say("40 11 тяжело")
+    await c.say("45 11 тяжело")
     w = await db.get_workout(w["id"])
     assert w["set_i"] == 2
     await c.say("/finish")
@@ -174,13 +177,13 @@ async def test_workout_session_via_telegram(rig):
     assert any("Тренировка завершена" in t for t in session.texts())
 
 
-async def test_minor_gets_small_creatine_dose_without_llm(rig):
+async def test_minor_gets_personal_creatine_plan_without_llm(rig):
     bot, dp, db, session = rig
     c = Chatter(bot, dp)
     await onboard(c)
     await c.say("сколько креатина мне принимать?")
     text = "\n".join(session.texts())
-    assert "3 г в день" in text and "Скажи родителям" in text
+    assert "62 кг" in text and "3 г в день" in text and "Скажи родителям" in text
     assert not any(n == "SendChatAction" for n, _ in session.sent)  # ИИ не вызывался
 
 
@@ -194,18 +197,110 @@ async def test_minor_still_blocked_from_stimulants_and_diets(rig):
     assert "подросткам нельзя" in text and "Диеты, сушку" in text
 
 
-async def test_minor_can_build_stack_and_get_reminder_text(rig):
+async def test_owned_supplements_plan_say_what_not_to_take(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)  # 15 лет, 62 кг, цель набор мышц
+    await c.say("у меня есть креатин, протеин и предтрен")
+    assert set(await db.stack_list(1)) == {"creatine", "whey", "preworkout"}
+    text = "\n".join(session.texts())
+    assert "Принимай" in text and "3 г в день" in text  # креатин подростку
+    assert "Не принимай" in text and "Предтрен" in text  # опасное
+    assert "белок за день: 100–120 г" in text.replace("\xa0", " ") or "Весь белок за день" in text
+    await c.say("/supp_time 09:30")
+    assert (await db.get_user(1))["supp_time"] == "09:30"
+
+
+async def test_supplement_buttons_toggle_and_plan(rig):
     bot, dp, db, session = rig
     c = Chatter(bot, dp)
     await onboard(c)
     from bot.ui import Sup
-    await c.press(Sup(act="add", id="creatine"))
-    await c.press(Sup(act="add", id="preworkout"))  # опасное: не добавляется
+    await c.press(Sup(act="tg", id="creatine"))
+    await c.press(Sup(act="tg", id="bcaa"))
+    assert set(await db.stack_list(1)) == {"creatine", "bcaa"}
+    await c.press(Sup(act="tg", id="bcaa"))
     assert await db.stack_list(1) == ["creatine"]
-    await c.say("/stack")
-    assert any("3 г в день" in t for t in session.texts())
-    await c.say("/supp_time 09:30")
-    assert (await db.get_user(1))["supp_time"] == "09:30"
+    await c.press(Sup(act="plan"))
+    assert any("План приёма добавок" in t for t in session.texts())
+
+
+async def test_places_multiselect_and_switch_on_day(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await c.say("/start")
+    for v in ("15", "62", "175"):
+        await c.say(v)
+    await c.press(Ob(act="mnone"))
+    await finish_onboarding(c, places=("gym", "home_db", "home_bw"))
+    u = await db.get_user(1)
+    assert u["place"] == "gym" and u["places"] == "gym,home_db,home_bw"
+    await c.say("/today")
+    w = await db.next_planned_workout(1)
+    assert w["place"] == "gym"
+    await c.press(Rem(act="p_home_bw", wid=w["id"]))
+    w = await db.get_workout(w["id"])
+    assert w["place"] == "home_bw" and w["status"] == "planned"
+
+
+async def test_time_set_as_text_and_changed_from_chat(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await c.say("/start")
+    for v in ("15", "62", "175"):
+        await c.say(v)
+    await c.press(Ob(act="mnone"))
+    await finish_onboarding(c, time_text="19:15")
+    assert (await db.get_user(1))["train_time"] == "19:15"
+    await c.say("напоминай в 20:30")
+    assert (await db.get_user(1))["train_time"] == "20:30"
+    await c.say("тренируюсь по вторникам, четвергам и субботам")
+    u = await db.get_user(1)
+    assert u["days"] == "1,3,5" and u["days_per_week"] == 3
+    await c.say("во сколько лучше тренироваться?")  # вопрос не меняет настройки
+    assert (await db.get_user(1))["train_time"] == "20:30"
+
+
+async def test_double_tap_on_start_does_not_duplicate_card(rig):
+    import asyncio
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await c.say("/today")
+    w = await db.next_planned_workout(1)
+    before = len([n for n, _ in session.sent if n in ("SendAnimation", "SendMessage", "SendMediaGroup")])
+    await asyncio.gather(c.press(Rem(act="go", wid=w["id"])), c.press(Rem(act="go", wid=w["id"])))
+    cards = [n for n, d in session.sent if n in ("SendAnimation", "SendMessage") and "1/" in (d.get("text") or d.get("caption") or "")]
+    assert len(cards) == 1, "двойной тап не должен слать вторую карточку упражнения"
+    assert before >= 1
+
+
+async def test_pain_message_stops_instead_of_logging(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await c.say("/today")
+    w = await db.next_planned_workout(1)
+    await c.press(Rem(act="go", wid=w["id"]))
+    await c.say("колено болит")
+    assert any("Боль в суставе" in t for t in session.texts())
+    assert await db.workout_sets(w["id"]) == []
+
+
+async def test_one_message_per_set_and_text_feel(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await c.say("/today")
+    w = await db.next_planned_workout(1)
+    await c.press(Rem(act="go", wid=w["id"]))
+    n0 = len([1 for n, _ in session.sent if n == "SendMessage"])
+    await c.say("40 10")          # 1 сообщение: «Как далось?»
+    await c.say("нормально")      # 1 сообщение: итог + подсказка + следующий подход вместе
+    n1 = len([1 for n, _ in session.sent if n == "SendMessage"])
+    assert n1 - n0 == 2
+    w = await db.get_workout(w["id"])
+    assert w["set_i"] == 1
 
 
 async def test_photo_instead_of_tape_in_onboarding(rig):

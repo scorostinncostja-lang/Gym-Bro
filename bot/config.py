@@ -8,6 +8,11 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
 
+# Актуальные модели по умолчанию. Если в .env закреплено имя, которое провайдер уже убрал
+# (404 «model not found»), бот переходит на эти.
+DEFAULT_GROQ_LLM = "openai/gpt-oss-120b"
+DEFAULT_GROQ_VISION = "qwen/qwen3.8-27b"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ROOT / ".env", extra="ignore")
@@ -18,9 +23,13 @@ class Settings(BaseSettings):
 
     # Имена моделей меняются у провайдеров часто, поэтому только через .env.
     gemini_model: str = "gemini-3.8-flash"
-    groq_llm_model: str = "llama-3.3-70b-versatile"
-    groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
+    gemini_fallback_model: str = "gemini-3.6-flash"  # если основная перегружена (503)
+    groq_llm_model: str = DEFAULT_GROQ_LLM
+    groq_vision_model: str = DEFAULT_GROQ_VISION
     groq_stt_model: str = "whisper-large-v3-turbo"
+
+    # INFO для отладки, WARNING для сервера (в журнал попадают только ошибки).
+    log_level: str = "INFO"
 
     db_path: Path = ROOT / "var" / "gymbro.db"
     default_tz: str = "Europe/Moscow"

@@ -119,8 +119,6 @@ def test_guard_blocks_drugs_for_everyone():
 
 
 @pytest.mark.parametrize("text,reason", [
-    ("сколько креатина принимать в день?", "minor_supp_dose"),
-    ("как пить протеин и когда", "minor_supp_dose"),
     ("хочу жиросжигатель", "minor_stimulant"),
     ("как быстро похудеть, дефицит калорий?", "minor_diet"),
     ("хочу умереть", "red_flag"),
@@ -156,11 +154,60 @@ def test_teen_whitelist_and_dangerous_never_allowed():
         assert not (s["verdict"] in ("dangerous", "useless") and s["teen"]["ok"])
 
 
-def test_dose_reply_uses_reference_and_handles_unknown():
-    from bot.services.supp_advice import dose_reply
-    assert "3 г в день" in dose_reply("сколько креатина")
-    assert "кофеин" in dose_reply("доза кофеина").lower()
-    assert "Спроси про конкретную" in dose_reply("какие добавки мне пить")
+def test_supp_plan_scales_with_weight_and_age():
+    from bot.services.supp_plan import build_plan
+    teen = {"age": 15, "weight_kg": 62, "goal": "muscle", "train_time": "18:00"}
+    adult = {"age": 25, "weight_kg": 90, "goal": "muscle", "train_time": "18:00"}
+    owned = ["creatine", "whey", "caffeine", "preworkout", "bcaa", "omega3"]
+    t = {ln.sid: ln for ln in build_plan(teen, owned).lines}
+    a = {ln.sid: ln for ln in build_plan(adult, owned).lines}
+    assert t["creatine"].status == "take" and t["creatine"].dose.startswith("3 г")
+    assert a["creatine"].dose.startswith("4.5 г") or a["creatine"].dose.startswith("4 г") or a["creatine"].dose.startswith("5 г")
+    assert t["caffeine"].status == "skip" and a["caffeine"].status == "maybe"  # подросткам кофеин нет
+    assert "200 мг" in a["caffeine"].dose
+    assert t["preworkout"].status == "avoid" and a["preworkout"].status == "avoid"
+    assert t["bcaa"].status == "skip"
+    assert "85–110 г" in t["whey"].note  # 1.6 г на кг ± 0.2 при 62 кг
+    # у подростка порошка не больше одной порции, у тяжёлого взрослого может быть две
+    assert t["whey"].dose.startswith("1 порц.")
+
+
+def test_supp_plan_timeline_uses_training_time():
+    from bot.services.supp_plan import _timeline, build_plan
+    plan = build_plan({"age": 25, "weight_kg": 80, "goal": "muscle", "train_time": "18:00"}, ["caffeine", "whey", "vitd"])
+    text = " ".join(_timeline(plan))
+    assert "17:15" in text and "19:15" in text
+
+
+def test_intents_schedule_and_supplements():
+    from bot.services.intents import parse_schedule_change, parse_supp_intent
+    c = parse_schedule_change("напоминай в 19:30")
+    assert c and c.time == "19:30" and c.days is None
+    c = parse_schedule_change("давай тренироваться по пн, ср и пт в 7 вечера")
+    assert c and c.days == [0, 2, 4] and c.time == "19:00"
+    assert parse_schedule_change("во сколько лучше тренироваться?") is None
+    assert parse_schedule_change("как делать присед") is None
+    c = parse_schedule_change("хочу 4 раза в неделю")
+    assert c and c.per_week == 4
+    assert parse_supp_intent("у меня есть креатин и протеин") == (["creatine", "whey"], True)
+    assert parse_supp_intent("сколько креатина пить") == (["creatine"], False)
+    assert parse_supp_intent("полезен ли креатин") is None
+
+
+def test_start_weights_depend_on_body_age_and_level():
+    from bot.services.start_weights import is_hand, start_weight
+    assert start_weight("db_curl", 62, 15, "new", 1) == 4
+    assert start_weight("db_curl", 90, 25, "some", 1) >= 7
+    assert start_weight("leg_press", 62, 15, "new", 5) == 40
+    assert start_weight("plank", 62, 15, "new", 0) is None  # без веса оценки нет
+    assert is_hand("db_curl") and not is_hand("goblet_squat")
+
+
+def test_pain_words_detected_but_muscle_burn_is_not():
+    from bot.services.set_parser import mentions_pain
+    assert mentions_pain("колено болит") and mentions_pain("хруст в плече")
+    assert not mentions_pain("жжёт мышцу, тяжело")
+    assert not mentions_pain("как избежать травм?")
 
 
 def test_supplement_data_valid():
@@ -226,3 +273,19 @@ async def test_gemini_call_has_thinking_headroom_and_no_temperature():
     assert cfg.max_output_tokens == 100 + GEMINI_THINKING_HEADROOM
     assert cfg.temperature is None
     assert cfg.thinking_config.thinking_level.value == "LOW"
+
+
+def test_every_exercise_card_fits_one_caption():
+    """Карточка = подпись к GIF (лимит Telegram 1024), иначе придётся слать два сообщения."""
+    from bot.cards import CAPTION_LIMIT
+    from bot.handlers.workout import exercise_text
+    from bot.services.progression import Target
+
+    long_note = "Все подходы по 12 и было не на пределе: пора прибавить, 102.5 кг. " * 1
+    for ex in exercises().values():
+        lo, hi = ex.range
+        item = {"ex_id": ex.id, "sets": 4, "lo": lo, "hi": hi, "kind": ex.kind, "step": ex.step}
+        w = {"ex_i": 5, "plan": [item] * 6, "set_i": 0, "cur_weight": 102.5, "cur_reps": hi}
+        last = [{"weight": 102.5, "reps": hi}] * 4
+        text = exercise_text(w, item, ex, Target(102.5, hi, long_note), last)
+        assert len(text) <= CAPTION_LIMIT, (ex.id, len(text))

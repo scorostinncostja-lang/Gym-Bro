@@ -67,7 +67,7 @@ async def test_pending_feel_flow_and_swap(env):
     sid, outcome = await svc.log_set(w, ParsedSet(30, 10, None))
     assert outcome is None
     out = await svc.complete_set(w["id"], sid, Feel.EASY)
-    assert out.state == "next_set" and "Легко" in out.hint_text
+    assert out.state == "next_set" and "слишком легко" in out.hint_text  # первое упражнение: калибровка веса
     # swap после начатого подхода запрещён
     assert not await svc.swap_exercise(w["id"])
 
@@ -112,3 +112,13 @@ async def test_stale_active_workout_is_closed(env):
     fresh = await svc.ensure_planned(user, date(2026, 1, 7))
     await svc.start(fresh["id"], datetime.now(timezone.utc).isoformat(timespec="seconds"))
     assert (await db.active_workout(1))["id"] == fresh["id"]
+
+
+async def test_first_session_gets_start_weight_from_body_weight(env):
+    db, svc = env
+    user = await db.get_user(1)  # 15 лет, 60 кг, новичок
+    w = await svc.ensure_planned(user, date(2026, 1, 5))
+    w = await svc.start(w["id"], "now")
+    item = w["plan"][w["ex_i"]]
+    if item["kind"] == "weight":
+        assert w["cur_weight"] and w["cur_weight"] > 0  # не «подбери сам»

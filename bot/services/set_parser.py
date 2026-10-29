@@ -12,6 +12,12 @@ _FEEL_PATTERNS: list[tuple[Feel, re.Pattern]] = [
     (Feel.OK, re.compile(r"нормально|\bнорм\b|средне|\bок\b|окей")),
 ]
 
+# Боль в суставе или спине: сразу стоп. Мышечное жжение сюда не входит.
+_PAIN = re.compile(
+    r"\bболит|\bболь\b|болев|\bноет|\bныл[оаи]?\b|прострел|хруст|щёлк|щелк|\bстрельн|онемел|немеет|"
+    r"защемил|потянул|круж\w+\s+голов|тошнит|темнеет\s+в\s+глазах"
+)
+
 _NUM = r"\d+(?:[.,]\d+)?"
 _WEIGHT_RE = re.compile(rf"({_NUM})\s*(?:кг|kg)\b")
 _REPS_RE = re.compile(r"(\d+)\s*(?:раз|повтор\w*|повт\b|р\b)")
@@ -32,6 +38,10 @@ def detect_feel(text: str) -> Feel | None:
         if pat.search(t):
             return feel
     return None
+
+
+def mentions_pain(text: str) -> bool:
+    return bool(_PAIN.search(text.lower()))
 
 
 def _num(s: str) -> float:

@@ -7,6 +7,7 @@ from bot.db.database import Database
 from bot.services.exercise_db import ExerciseDB
 from bot.services.program_builder import alternatives, build_day, template_for
 from bot.services.progression import Feel, SetResult, Target, next_target, set_hint
+from bot.services.start_weights import start_weight
 from bot.services.set_parser import ParsedSet
 
 
@@ -49,7 +50,12 @@ class WorkoutService:
     async def target_for(self, tg_id: int, item: dict, workout_id: int) -> tuple[Target, list[dict]]:
         last = await self.db.last_sets(tg_id, item["ex_id"], exclude_workout=workout_id)
         results = [SetResult(s["weight"], s["reps"], Feel(s["feel"])) for s in last]
-        return next_target(results, item["lo"], item["hi"], item["kind"], item["step"]), last
+        start = None
+        if not last and item["kind"] == "weight":
+            user = await self.db.get_user(tg_id)
+            if user:
+                start = start_weight(item["ex_id"], user["weight_kg"], user["age"], user["level"], item["step"])
+        return next_target(results, item["lo"], item["hi"], item["kind"], item["step"], start), last
 
     async def start(self, workout_id: int, now_iso: str) -> dict:
         w = await self.db.get_workout(workout_id)
@@ -91,7 +97,11 @@ class WorkoutService:
         assert w and s
         item = w["plan"][w["ex_i"]]
         await self.db.set_feel(set_id, int(feel))
-        hint = set_hint(SetResult(s["weight"], s["reps"], feel), item["lo"], item["hi"], item["kind"], item["step"])
+        calibrating = not await self.db.last_sets(w["tg_id"], item["ex_id"], exclude_workout=workout_id)
+        hint = set_hint(
+            SetResult(s["weight"], s["reps"], feel), item["lo"], item["hi"], item["kind"], item["step"],
+            calibrating=calibrating,
+        )
 
         set_i = w["set_i"] + 1
         if set_i < item["sets"]:

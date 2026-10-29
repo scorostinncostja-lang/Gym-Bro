@@ -11,6 +11,7 @@ from aiogram.types import CallbackQuery, Message
 from bot.data import PLACES
 from bot.photo_guide import ASK_METHOD, GUIDE, SHOT_NAMES, SHOTS, next_shot_text
 from bot.db.database import Database
+from bot.services.places import ORDER, primary_place, user_places
 from bot.services.program_builder import template_for, build_day
 from bot.services.reminders import Reminders
 from bot.services.timeutil import (
@@ -36,7 +37,6 @@ MEASURE_UNITS = {"weight": "кг"}
 GOALS = {"muscle": "💪 Набрать мышцы", "strength": "🏋️ Стать сильнее", "fit": "🤸 Общая форма и здоровье", "lose": "🔥 Похудеть"}
 LEVELS = {"new": "Новичок", "some": "Занимаюсь 3–12 месяцев"}
 PRESET_DAYS = {2: [0, 3], 3: [0, 2, 4], 4: [0, 1, 3, 4]}
-TIMES = ["1600", "1700", "1800", "1900", "2000"]
 
 
 class Onb(StatesGroup):
@@ -343,19 +343,61 @@ async def on_level(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
     await state.update_data(level=callback_data.arg)
+    await _ask_places(cb.message, state, set())
+
+
+def _places_kb(selected: set[str]):
+    rows = [[(("✅ " if k in selected else "") + v, Ob(act="pl", arg=k))] for k, v in PLACES.items()]
+    if selected:
+        rows.append([("Готово ➡", Ob(act="pldone"))])
+    return inline(rows)
+
+
+async def _ask_places(message: Message, state: FSMContext, selected: set[str]):
     await state.set_state(Onb.place)
-    await cb.message.answer(
-        "<b>Где будешь тренироваться?</b> Дома можно переключиться на любой тренировке.",
-        reply_markup=inline([[(v, Ob(act="place", arg=k))] for k, v in PLACES.items()]),
+    await state.update_data(places=sorted(selected))
+    await message.answer(
+        "<b>Где ты можешь тренироваться?</b> Отметь всё, что подходит, можно несколько. "
+        "Программа строится под основное место (зал, если он есть), а в день тренировки "
+        "одной кнопкой переключаешься на другое: «некогда в зал» — делаешь дома.",
+        reply_markup=_places_kb(selected),
     )
 
 
-@router.callback_query(Ob.filter(F.act == "place"), Onb.place)
-async def on_place(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
+@router.callback_query(Ob.filter(F.act == "pl"), Onb.place)
+async def on_place_toggle(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
     await cb.answer()
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(place=callback_data.arg)
+    selected = set((await state.get_data()).get("places", []))
+    selected ^= {callback_data.arg}
+    await state.update_data(places=sorted(selected))
+    await cb.message.edit_reply_markup(reply_markup=_places_kb(selected))
+
+
+@router.callback_query(Ob.filter(F.act == "pldone"), Onb.place)
+async def on_places_done(cb: CallbackQuery, state: FSMContext, db: Database):
+    data = await state.get_data()
+    places = [p for p in ORDER if p in set(data.get("places", []))]
+    if not places:
+        await cb.answer("Выбери хотя бы одно место.", show_alert=True)
+        return
+    await cb.answer()
+    main = primary_place(places)
+    await cb.message.edit_text(f"Места: {', '.join(PLACES[p] for p in places)}. Основное: {PLACES[main]}.")
+    if data.get("mode") == "places":
+        await db.update_user(cb.from_user.id, place=main, places=",".join(places))
+        await state.clear()
+        await cb.message.answer("Сохранил. Новые тренировки уже под это. Смотри: /plan", reply_markup=main_menu())
+        return
+    await state.update_data(place=main, places=places)
     await _ask_days_n(cb.message, state)
+
+
+@router.callback_query(St.filter(F.act == "place"))
+async def settings_places(cb: CallbackQuery, state: FSMContext, db: Database):
+    await cb.answer()
+    user = await db.get_user(cb.from_user.id)
+    await state.set_data({"mode": "places"})
+    await _ask_places(cb.message, state, set(user_places(user)) if user else set())
 
 
 # ---------- расписание ----------
@@ -424,8 +466,8 @@ async def on_days_done(cb: CallbackQuery, state: FSMContext):
         warn = "\nДва дня подряд — тяжелее восстановиться, но можно."
     await state.set_state(Onb.time)
     await cb.message.answer(
-        "<b>Во сколько напоминать?</b> Кнопкой или напиши время, например 17:30." + warn,
-        reply_markup=inline([[(f"{t[:2]}:{t[2:]}", Ob(act="t", arg=t)) for t in TIMES]]),
+        "<b>Во сколько напоминать?</b> Напиши время, например <code>18:30</code>. "
+        "Потом его можно поменять прямо в чате: «напоминай в 19:00»." + warn,
     )
 
 
@@ -444,19 +486,11 @@ async def _after_time(message: Message, state: FSMContext, time_str: str, db: Da
     await _ask_tz(message, state)
 
 
-@router.callback_query(Ob.filter(F.act == "t"), Onb.time)
-async def on_time_btn(cb: CallbackQuery, callback_data: Ob, state: FSMContext, db: Database, reminders: Reminders):
-    await cb.answer()
-    t = callback_data.arg
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await _after_time(cb.message, state, f"{t[:2]}:{t[2:]}", db, reminders)
-
-
 @router.message(Onb.time)
 async def on_time_text(message: Message, state: FSMContext, db: Database, reminders: Reminders):
     t = parse_time(message.text or "")
     if not t:
-        await message.answer("Время вида 18:30.")
+        await message.answer("Не понял время. Напиши так: <code>18:30</code> или просто <code>18</code>.")
         return
     await _after_time(message, state, t, db, reminders)
 
@@ -522,7 +556,8 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     days = data["days"]
     await db.update_user(
         tg_id, age=data["age"], weight_kg=data["weight"], height_cm=data["height"], goal=data["goal"],
-        level=data["level"], place=data["place"], days_per_week=data["days_per_week"],
+        level=data["level"], place=data["place"], places=",".join(data.get("places") or [data["place"]]),
+        days_per_week=data["days_per_week"],
         days=",".join(map(str, days)), train_time=data["train_time"], tz=tz, rotation_idx=0, onboarded=1,
     )
     today = local_today(tz).isoformat()

@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS users (
     weight_kg REAL,
     goal TEXT,
     level TEXT,
-    place TEXT,
+    place TEXT,                -- основное место (по нему строится программа)
+    places TEXT,               -- все доступные места: "gym,home_db,home_bw"
     days_per_week INTEGER,
     days TEXT,                 -- weekday numbers, Mon=0: "0,2,4"
     train_time TEXT,           -- "18:00"
@@ -97,7 +98,7 @@ CREATE INDEX IF NOT EXISTS ix_chat ON chat(tg_id, id);
 """
 
 USER_FIELDS = {
-    "name", "age", "height_cm", "weight_kg", "goal", "level", "place", "days_per_week",
+    "name", "age", "height_cm", "weight_kg", "goal", "level", "place", "places", "days_per_week",
     "days", "train_time", "tz", "rotation_idx", "supp_time", "supp_remind", "onboarded",
 }
 WORKOUT_FIELDS = {
@@ -123,7 +124,16 @@ class Database:
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.executescript(SCHEMA)
+        await self._migrate()
         await self._db.commit()
+
+    async def _migrate(self) -> None:
+        """Старые базы: добавляем колонки, которых ещё не было."""
+        async with self.db.execute("PRAGMA table_info(users)") as cur:
+            cols = {r["name"] for r in await cur.fetchall()}
+        if "places" not in cols:
+            await self.db.execute("ALTER TABLE users ADD COLUMN places TEXT")
+        await self.db.execute("UPDATE users SET places=place WHERE places IS NULL AND place IS NOT NULL")
 
     async def close(self) -> None:
         if self._db:

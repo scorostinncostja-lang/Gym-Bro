@@ -47,10 +47,19 @@ def _fmt(x: float) -> str:
     return str(int(x)) if float(x).is_integer() else f"{x:g}"
 
 
-def next_target(last: list[SetResult], lo: int, hi: int, kind: str, step: float) -> Target:
+def next_target(
+    last: list[SetResult], lo: int, hi: int, kind: str, step: float, start_weight: float | None = None,
+) -> Target:
     """Цель на следующую тренировку по результатам прошлой."""
     if not last:
         if kind == "weight":
+            if start_weight is not None:
+                return Target(
+                    start_weight, lo,
+                    f"Первый раз. Стартовый вес {_fmt(start_weight)} кг — оценка по твоему весу тела. "
+                    f"Делай {lo}–{hi} повторов и остановись, когда в запасе останется 2–3. "
+                    "Слишком легко или тяжело — скажи после подхода, я подстрою вес.",
+                )
             return Target(
                 None, lo,
                 f"Первый раз: подбери вес, с которым сделаешь {hi} повторов "
@@ -84,8 +93,12 @@ def next_target(last: list[SetResult], lo: int, hi: int, kind: str, step: float)
     return Target(0, reps, "Цель — чуть больше, чем в прошлый раз.")
 
 
-def set_hint(res: SetResult, lo: int, hi: int, kind: str, step: float) -> Hint:
-    """Подсказка после подхода: что менять в следующем подходе."""
+def set_hint(res: SetResult, lo: int, hi: int, kind: str, step: float, calibrating: bool = False) -> Hint:
+    """Подсказка после подхода: что менять в следующем подходе.
+
+    calibrating: упражнение выполняется впервые, стартовый вес был оценкой, поэтому «легко»
+    сразу добавляет вес, не дожидаясь верха диапазона.
+    """
     w = res.weight if kind == "weight" else None
     if res.feel == Feel.MAX:
         return Hint(
@@ -97,6 +110,11 @@ def set_hint(res: SetResult, lo: int, hi: int, kind: str, step: float) -> Hint:
         new_w = max(step, res.weight - step)
         return Hint(f"Повторов мало. В следующем подходе снизь вес до {_fmt(new_w)} кг.", new_w, lo)
     if res.feel == Feel.EASY:
+        if kind == "weight" and calibrating:
+            return Hint(
+                f"Для старта слишком легко. В следующем подходе +{_fmt(step)} кг: {_fmt(res.weight + step)} кг.",
+                res.weight + step, lo,
+            )
         if kind == "weight" and res.reps >= hi:
             return Hint(f"Легко и повторов выше нормы. В следующем подходе +{_fmt(step)} кг.", res.weight + step, lo)
         nxt = res.reps + (5 if kind == "time" else 1)
