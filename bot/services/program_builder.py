@@ -35,8 +35,10 @@ def _candidates(pattern: str, allowed: set[str], exclude: set[str], level: str |
     return sorted(out, key=lambda e: _prio(e.equip))  # sorted стабилен: внутри приоритета порядок файла
 
 
-def make_item(ex: Exercise, sets: int, goal: str | None, age: int | None) -> PlanItem:
-    lo, hi = goals.rep_range(goal, ex.kind, ex.range, age)
+def make_item(
+    ex: Exercise, sets: int, goal_list: list[str] | str | None, age: int | None, compound_index: int | None = None,
+) -> PlanItem:
+    lo, hi = goals.rep_range(goal_list, ex.kind, ex.range, age, ex.pattern, compound_index)
     if ex.kind in ("time", "cardio"):
         sets = min(sets, 3) if ex.kind == "time" else 1
     return PlanItem(ex.id, sets, lo, hi, ex.kind, ex.step)
@@ -57,19 +59,24 @@ def build_day(template: dict, user: dict, place: str | None = None, finisher: bo
     """Заполняет слоты шаблона упражнениями под инвентарь, уровень и цель."""
     place = place or user["place"]
     allowed = tags(user, place)
-    level, goal, age = user.get("level"), user.get("goal"), user.get("age")
+    level, age = user.get("level"), user.get("age")
+    goal_list = goals.user_goals(user)
     chosen: set[str] = set()
     plan: list[PlanItem] = []
+    compounds = 0
     for slot in template["slots"]:
         for pattern in [slot["p"], *slot.get("fb", [])]:
             cands = _candidates(pattern, allowed, chosen, level)
             if cands:
                 ex = cands[0]
                 chosen.add(ex.id)
-                plan.append(make_item(ex, slot["sets"], goal, age))
+                idx = compounds if ex.pattern in goals.COMPOUND else None
+                plan.append(make_item(ex, slot["sets"], goal_list, age, idx))
+                if idx is not None:
+                    compounds += 1
                 break
     if finisher:
-        minutes = goals.finisher_minutes(goal, user.get("goal2"))
+        minutes = goals.finisher_minutes(goal_list)
         if minutes and not any(i.kind == "time" for i in plan):  # у дня гибкости финишер не нужен
             fin = cardio_item(user, place, minutes)
             if fin:
@@ -80,7 +87,7 @@ def build_day(template: dict, user: dict, place: str | None = None, finisher: bo
 def build_extra_day(user: dict, place: str | None = None, index: int = 0) -> tuple[str, list[PlanItem]]:
     """Дополнительный день: гибкость, если цель гибкость, иначе кардио."""
     place = place or user["place"]
-    if goals.extra_kind(user.get("goal")) == "flex":
+    if goals.extra_kind(goals.user_goals(user)) == "flex":
         tpl = flex_template()
         return tpl["name"], build_day(tpl, user, place, finisher=False)
     item = cardio_item(user, place, None, index)

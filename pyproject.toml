@@ -9,6 +9,7 @@ dependencies = [
     "apscheduler>=3.10,<4",
     "google-genai>=1.0",
     "groq>=0.13",
+    "pillow>=10",
     "pydantic-settings>=2.4",
     "tzdata",
 ]

@@ -225,8 +225,9 @@ def test_whey_label_checks_protein_share_and_price():
     v = evaluate(whey, TEEN)
     assert v.level == "yellow" and any("Белка меньше" in f or "55–70%" in f for f in v.flags)
     assert any("Сахара" in f for f in v.flags)
-    text = render(v, 10000)
-    assert "За 100 г чистого белка" in text
+    from bot.services.supp_label import render_price
+    text = render_price(v, whey, 10000)
+    assert "За 100 г чистого белка" in text and "Порция" in text
 
 
 def test_teen_gets_red_for_unsuitable_supplement_and_vitd_overdose():
@@ -265,3 +266,117 @@ def test_shops_data_is_consistent():
     for sid, b in d["brands"].items():
         assert b["what"] and b["best"] and b["fit"] and b["budget"], sid
     json.dumps(d)
+
+
+def test_gmp_is_not_independent_testing_and_pure_creatine_dose_is_inferred():
+    maxler = {"readable": True, "kind": "creatine", "brand": "Maxler", "product": "Creatine 100% Monohydrate",
+              "serving_g": 5, "servings": 60, "net_g": 300, "per_serving": {"creatine_g": None},
+              "certs": ["GMP standards"], "expiry_visible": False, "importer_visible": False}
+    v = evaluate(maxler, TEEN)
+    assert not any("независимой проверки:" in g for g in v.good)
+    assert any("GMP" in i and "не независимая" in i for i in v.info)
+    assert "3 г" in v.dose and v.days_supply == pytest.approx(100)
+    assert v.level == "green" and "срок годности" in v.missing  # то, чего нет на фото, не ухудшает оценку
+    assert "Дошли фото" in render(v)
+
+
+def test_price_answer_never_repeats_whole_verdict():
+    from bot.services.supp_label import render_price
+    bare = {"readable": True, "kind": "creatine", "brand": "X", "net_g": 300, "per_serving": {}}
+    text = render_price(evaluate(bare, TEEN), bare, 2750)
+    assert text.startswith("💰") and "За 100 г продукта" in text and "Хорошо" not in text
+    empty = {"readable": True, "kind": "creatine", "per_serving": {}}
+    assert "Дошли фото состава" in render_price(evaluate(empty, TEEN), empty, 2750)
+
+
+def test_more_photos_merge_into_previous_label():
+    from bot.services.supp_label import merge_labels
+    front = {"readable": True, "kind": "whey", "brand": "ON", "product": "Gold Standard", "per_serving": {},
+             "certs": [], "expiry_visible": False}
+    back = {"readable": True, "kind": "whey", "brand": None, "serving_g": 30, "servings": 70,
+            "per_serving": {"protein_g": 24}, "certs": ["Informed Sport"], "expiry_visible": True}
+    m = merge_labels(front, back)
+    assert m["brand"] == "ON" and m["per_serving"]["protein_g"] == 24 and m["certs"] == ["Informed Sport"]
+    assert m["expiry_visible"] is True
+
+
+# ---------- несколько целей ----------
+def test_all_goals_from_users_sentence():
+    text = "Сила,объем мыщц,выносливость,рельеф\nВыглядеть большим и бегать очень быстро и долгое время"
+    assert goals.parse_goals(text, 15) == ["strength", "muscle", "endurance", "definition"]
+
+
+def test_hybrid_program_strength_for_basics_size_for_accessories():
+    user = {"place": "gym", "level": "new", "age": 25, "goals": "strength,muscle,endurance"}
+    plan = build_day(template_for(3, 0), user)
+    by_ex = {p.ex_id: (p.lo, p.hi) for p in plan}
+    compounds = [p for p in plan if exercises()[p.ex_id].pattern in goals.COMPOUND]
+    assert (compounds[0].lo, compounds[0].hi) == (5, 8) and (compounds[1].lo, compounds[1].hi) == (5, 8)
+    accessories = [p for p in plan if p.kind == "weight" and exercises()[p.ex_id].pattern not in goals.COMPOUND]
+    assert accessories and all((p.lo, p.hi) == (8, 12) for p in accessories), by_ex
+    assert plan[-1].kind == "cardio"  # выносливость добавляет финишер
+    assert goals.extra_days(["strength", "muscle", "endurance"]) >= 2
+
+
+def test_conflict_note_is_honest():
+    note = goals.conflict_note(["strength", "muscle", "endurance", "definition"], 15)
+    assert "Базовые упражнения" in note and "без дефицита калорий" in note and "Первые 3–6 месяцев" in note
+    assert goals.conflict_note(["muscle"], 15) == ""
+
+
+def test_old_profiles_still_read_goal_and_goal2():
+    assert goals.user_goals({"goal": "muscle", "goal2": "flex"}) == ["muscle", "flex"]
+    assert goals.user_goals({"goals": "strength,endurance", "goal": "muscle"}) == ["strength", "endurance"]
+    assert goals.user_goals({}) == ["fit"]
+
+
+def test_rest_time_depends_on_goal_and_feel():
+    assert goals.rest_seconds(["strength"], "weight", "squat", 2) == 150
+    assert goals.rest_seconds(["strength", "muscle"], "weight", "biceps", 2) == 90
+    assert goals.rest_seconds(["definition"], "weight", "biceps", 4) == 120
+    assert goals.rest_seconds(["muscle"], "time", "core", None) == 30
+
+
+# ---------- надёжность ИИ ----------
+def test_cooldowns_by_error_type():
+    import asyncio as _a
+
+    from bot.services.llm import cooldown_for, short_error
+    quota = Exception("429 RESOURCE_EXHAUSTED quota exceeded, GenerateRequestsPerDayPerProjectPerModel")
+    rpm = Exception("429 RESOURCE_EXHAUSTED {'retryDelay': '37s'}")
+    assert cooldown_for(quota) == 6 * 3600 and cooldown_for(rpm) == 60
+    assert cooldown_for(_a.TimeoutError()) == 300 and cooldown_for(Exception("503 UNAVAILABLE")) == 120
+    assert short_error(quota) == "лимит бесплатной квоты"
+
+
+async def test_chain_skips_model_that_hit_quota():
+    from types import SimpleNamespace
+
+    from bot.config import Settings
+    from bot.services.llm import LLM
+
+    calls = []
+
+    async def gen(model, contents, config):
+        calls.append(model)
+        if model == "gemini-3.8-flash":
+            raise Exception("429 RESOURCE_EXHAUSTED per day")
+        return SimpleNamespace(text=f"ok from {model}")
+
+    llm = LLM(Settings(_env_file=None, bot_token="x", gemini_api_key="k", groq_api_key=""))
+    llm.gemini = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=gen)))
+    assert await llm.chat("s", [], "привет") == "ok from gemini-3.6-flash"
+    assert await llm.chat("s", [], "ещё") == "ok from gemini-3.6-flash"
+    assert calls == ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.6-flash"]  # 3.8 больше не дёргаем
+
+
+def test_big_photo_is_shrunk_for_groq():
+    import io
+
+    from PIL import Image
+
+    from bot.services.llm import shrink_image
+    buf = io.BytesIO()
+    Image.new("RGB", (3000, 2000), "white").save(buf, "JPEG")
+    small = shrink_image(buf.getvalue())
+    assert max(Image.open(io.BytesIO(small)).size) == 1024

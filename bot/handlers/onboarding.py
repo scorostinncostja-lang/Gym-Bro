@@ -60,7 +60,6 @@ class Onb(StatesGroup):
     tz = State()
     country = State()
     goal_text = State()
-    goal2 = State()
     gear = State()
     gear_detail = State()
 
@@ -326,31 +325,49 @@ async def _finish_measure_update(message: Message, state: FSMContext, db: Databa
 
 
 # ---------- цель, уровень, место ----------
+def _goals_kb(keys: list[str], chosen: list[str]):
+    rows = []
+    for k in keys:
+        mark = f"{chosen.index(k) + 1}. " if k in chosen else ""
+        rows.append([(f"{'✅ ' if k in chosen else ''}{mark}{GOALS[k]}", Ob(act="gl", arg=k))])
+    rows.append([("✍️ Написать самому", Ob(act="goal_text"))])
+    if chosen:
+        rows.append([("Готово ➡", Ob(act="gldone"))])
+    return inline(rows)
+
+
 async def _ask_goal(message: Message, state: FSMContext):
     data = await state.get_data()
     keys = goals_svc.goal_keys(data.get("age"))
+    chosen = [g for g in data.get("goals", []) if g in keys]
+    await state.update_data(goals=chosen)
     await state.set_state(Onb.goal)
-    rows = [[(GOALS[k], Ob(act="goal", arg=k))] for k in keys]
-    rows.append([("✍️ Написать самому", Ob(act="goal_text"))])
     await message.answer(
-        "<b>Какая у тебя главная цель?</b> Выбери кнопкой или напиши своими словами "
-        "(например: «хочу рельеф и выносливость»). От цели зависят повторы, кардио и растяжка.",
-        reply_markup=inline(rows),
+        "<b>Какие у тебя цели?</b> Отметь сколько угодно, порядок нажатия = приоритет. Или напиши своими "
+        "словами: «сила, объём, выносливость, рельеф». От целей зависят повторы, кардио и растяжка.",
+        reply_markup=_goals_kb(keys, chosen),
     )
 
 
-async def _after_goals(message: Message, state: FSMContext, db: Database):
+async def _after_goals(message: Message, state: FSMContext, db: Database, workouts: WorkoutService | None = None):
     """Цели выбраны: в анкете идём к уровню, в настройках сохраняем."""
     data = await state.get_data()
+    chosen = data["goals"]
+    summary = (
+        f"Цели: {goals_svc.goals_label(chosen)}.\n{goals_svc.goal_about(chosen[0])}"
+        + (f"\n\n{note}" if (note := goals_svc.conflict_note(chosen, data.get("age"))) else "")
+    )
+    fields = {"goals": ",".join(chosen), "goal": chosen[0], "goal2": chosen[1] if len(chosen) > 1 else None}
     if data.get("mode") == "goal":
-        await db.update_user(message.chat.id, goal=data["goal"], goal2=data.get("goal2"))
+        await db.update_user(message.chat.id, **fields)
+        user = await db.get_user(message.chat.id)
+        if user and workouts:
+            await workouts.refresh_planned(user)
         await state.clear()
-        about = goals_svc.goal_about(data["goal"])
-        await message.answer(
-            f"Цель: {goals_svc.goal_name(data['goal'])}. {about}\nНовые тренировки уже под неё: /plan",
-            reply_markup=main_menu(),
-        )
+        await message.answer(summary + "\n\nНовые тренировки уже под них: /plan", reply_markup=main_menu())
         return
+    await state.update_data(goals=chosen, goal=fields["goal"], goal2=fields["goal2"])  # в анкете храним список
+    await message.answer(summary)
     await state.set_state(Onb.level)
     await message.answer(
         "<b>Опыт в зале?</b>",
@@ -358,33 +375,28 @@ async def _after_goals(message: Message, state: FSMContext, db: Database):
     )
 
 
-async def _ask_goal2(message: Message, state: FSMContext):
+@router.callback_query(Ob.filter(F.act == "gl"), Onb.goal)
+async def on_goal_toggle(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
+    await cb.answer()
     data = await state.get_data()
-    keys = [k for k in goals_svc.goal_keys(data.get("age")) if k != data["goal"]]
-    await state.set_state(Onb.goal2)
-    rows = [[(GOALS[k], Ob(act="goal2", arg=k))] for k in keys]
-    rows.append([("Достаточно одной цели", Ob(act="goal2", arg="-"))])
-    await message.answer(
-        f"Главная: {goals_svc.goal_name(data['goal'])}. {goals_svc.goal_about(data['goal'])}\n\n"
-        "<b>Добавить вторую цель?</b> Она влияет на кардио и растяжку.",
-        reply_markup=inline(rows),
-    )
+    chosen = list(data.get("goals", []))
+    if callback_data.arg in chosen:
+        chosen.remove(callback_data.arg)
+    else:
+        chosen.append(callback_data.arg)
+    await state.update_data(goals=chosen)
+    await cb.message.edit_reply_markup(reply_markup=_goals_kb(goals_svc.goal_keys(data.get("age")), chosen))
 
 
-@router.callback_query(Ob.filter(F.act == "goal"), Onb.goal)
-async def on_goal(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
+@router.callback_query(Ob.filter(F.act == "gldone"), Onb.goal)
+async def on_goals_done(cb: CallbackQuery, state: FSMContext, db: Database, workouts: WorkoutService):
+    data = await state.get_data()
+    if not data.get("goals"):
+        await cb.answer("Выбери хотя бы одну цель.", show_alert=True)
+        return
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(goal=callback_data.arg, goal2=None)
-    await _ask_goal2(cb.message, state)
-
-
-@router.callback_query(Ob.filter(F.act == "goal2"), Onb.goal2)
-async def on_goal2(cb: CallbackQuery, callback_data: Ob, state: FSMContext, db: Database):
-    await cb.answer()
-    await cb.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(goal2=None if callback_data.arg == "-" else callback_data.arg)
-    await _after_goals(cb.message, state, db)
+    await _after_goals(cb.message, state, db, workouts)
 
 
 @router.callback_query(Ob.filter(F.act == "goal_text"), Onb.goal)
@@ -393,27 +405,22 @@ async def on_goal_text_btn(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_reply_markup(reply_markup=None)
     await state.set_state(Onb.goal_text)
     await cb.message.answer(
-        "Напиши, чего хочешь. Например: «объём мышц», «рельеф», «сила», «выносливость, бегать 5 км», "
-        "«гибкость, сесть на шпагат». Можно несколько."
+        "Напиши, чего хочешь, можно всё сразу. Например: «сила, объём мышц, выносливость, рельеф», "
+        "«выглядеть большим и бегать долго», «гибкость, сесть на шпагат»."
     )
 
 
 @router.message(Onb.goal_text, F.text, ~F.text.startswith("/"))
-async def on_goal_text(message: Message, state: FSMContext, db: Database):
+async def on_goal_text(message: Message, state: FSMContext, db: Database, workouts: WorkoutService):
     data = await state.get_data()
     found = goals_svc.parse_goals(message.text, data.get("age"))
     if not found:
         await message.answer(
-            "Не понял. Назови цель одним из слов: объём, рельеф, сила, выносливость, гибкость, "
-            "форма и здоровье. Или нажми /start и выбери кнопкой."
+            "Не понял. Назови цели словами: объём, рельеф, сила, выносливость, гибкость, форма и здоровье."
         )
         return
-    await state.update_data(goal=found[0], goal2=found[1] if len(found) > 1 else None)
-    await message.answer(
-        "Понял: " + goals_svc.goal_name(found[0]) + (f" и {goals_svc.goal_name(found[1])}" if len(found) > 1 else "")
-        + f".\n{goals_svc.goal_about(found[0])}"
-    )
-    await _after_goals(message, state, db)
+    await state.update_data(goals=found)
+    await _after_goals(message, state, db, workouts)
 
 
 @router.callback_query(Ob.filter(F.act == "level"), Onb.level)
@@ -723,12 +730,12 @@ async def on_time_text(message: Message, state: FSMContext, db: Database, remind
 async def _ask_extra(message: Message, state: FSMContext, db: Database):
     data = await state.get_data()
     uid = message.chat.id
-    if "goal" not in data:  # настройки: цель берём из профиля
+    if "goals" not in data:  # настройки: цели берём из профиля
         user = await db.get_user(uid)
-        await state.update_data(goal=(user or {}).get("goal"), goal2=(user or {}).get("goal2"))
+        await state.update_data(goals=goals_svc.user_goals(user))
         data = await state.get_data()
-    rec = goals_svc.extra_days(data.get("goal"), data.get("goal2"))
-    kind = "гибкости и растяжки" if goals_svc.extra_kind(data.get("goal")) == "flex" else "кардио"
+    rec = goals_svc.extra_days(data.get("goals"))
+    kind = "гибкости и растяжки" if goals_svc.extra_kind(data.get("goals")) == "flex" else "кардио"
     await state.set_state(Onb.extra)
     await message.answer(
         f"<b>Дополнительные дни для {kind}?</b> Бег, велосипед и велодорожки, дорожка, скакалка или ходьба "
@@ -857,7 +864,7 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     days = data["days"]
     await db.update_user(
         tg_id, age=data["age"], weight_kg=data["weight"], height_cm=data["height"], goal=data["goal"],
-        goal2=data.get("goal2"), level=data["level"], place=data["place"],
+        goal2=data.get("goal2"), goals=",".join(data.get("goals") or [data["goal"]]), level=data["level"], place=data["place"],
         places=",".join(data.get("places") or [data["place"]]),
         equipment=dump_gear(data.get("gear") or empty_gear()),
         cardio_days=",".join(map(str, data.get("cardio_days", []))),
@@ -880,9 +887,10 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
     items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in plan)
     extra = parse_days(user.get("cardio_days"))
-    extra_line = f"\nДополнительные дни ({goals_svc.extra_kind(user['goal'])}): {fmt_days(extra)}." if extra else ""
+    kind = "гибкость" if goals_svc.extra_kind(goals_svc.user_goals(user)) == "flex" else "кардио"
+    extra_line = f"\nДополнительные дни ({kind}): {fmt_days(extra)}." if extra else ""
     await message.answer(
-        f"Готово. Цель: {goals_svc.goal_name(user['goal'])}. Программа: {user['days_per_week']} трен./нед "
+        f"Готово. Цели: {goals_svc.goals_label(goals_svc.user_goals(user))}. Программа: {user['days_per_week']} трен./нед "
         f"({fmt_days(days)} в {user['train_time']}), {places_label(user_places(user))}.{extra_line}\n\n"
         f"<b>Первая тренировка — {html.escape(tpl['name'])}</b>\n{items}\n\n"
         f"Напомню: {when}. Хочешь начать раньше — кнопка «Тренировка».\n"

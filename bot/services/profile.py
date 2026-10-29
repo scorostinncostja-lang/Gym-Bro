@@ -1,13 +1,14 @@
 """Профиль пользователя для ИИ: что известно о человеке и текущей тренировке."""
 from bot.data import PLACES, get_exercise
 from bot.db.database import Database
+from bot.services.goals import goals_label, user_goals
 from bot.services.places import places_label, user_places
 
 
 async def build_profile(db: Database, user: dict) -> dict:
     profile = {
         "age": user["age"], "height_cm": user["height_cm"], "weight_kg": user["weight_kg"],
-        "goal": user["goal"], "level": user["level"],
+        "goal": goals_label(user_goals(user)), "level": user["level"],
         "place": places_label(user_places(user)) if user.get("place") in PLACES else user.get("place"),
         "days_per_week": user["days_per_week"], "streak": await db.streak(user["tg_id"]),
     }

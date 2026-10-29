@@ -14,6 +14,7 @@ from bot.services.supp_plan import build_plan, slot_lines
 from bot.services.timeutil import local_today, parse_days, shift_time
 from bot.services.workout import WorkoutService
 from bot.services.places import user_places
+from bot.services.report import weekly_text
 from bot.ui import Sup, inline, workout_keyboard
 
 log = logging.getLogger(__name__)
@@ -27,6 +28,8 @@ class Reminders:
         self.bot = bot
         self.db = db
         self.workouts = workouts
+        self.llm = None  # задаётся в main: нужен для комментария к недельному отчёту
+        self.settings = None
         self.scheduler = AsyncIOScheduler()
 
     async def start(self) -> None:
@@ -64,6 +67,12 @@ class Reminders:
                 )
         if user.get("supp_remind") and tz:
             self._schedule_supp(user, days, ZoneInfo(tz))
+        self._remove(f"wr:{tg_id}")
+        if tz and user.get("onboarded"):
+            self.scheduler.add_job(
+                self.send_weekly, CronTrigger(day_of_week="6", hour=19, minute=0, timezone=ZoneInfo(tz)),
+                args=[tg_id], id=f"wr:{tg_id}", misfire_grace_time=3600, coalesce=True, replace_existing=True,
+            )
 
     def _schedule_supp(self, user: dict, days: list[int], tz: ZoneInfo) -> None:
         """Добавки напоминаются в нужный момент: утром, перед тренировкой и после неё."""
@@ -84,11 +93,43 @@ class Reminders:
                     replace_existing=True,
                 )
 
+    # ---------- таймер отдыха ----------
+    def schedule_rest(self, tg_id: int, workout_id: int, ex_i: int, set_i: int, seconds: int) -> None:
+        when = datetime.now(ZoneInfo("UTC")) + timedelta(seconds=seconds)
+        self.scheduler.add_job(
+            self.send_rest_over, DateTrigger(run_date=when), args=[tg_id, workout_id, ex_i, set_i, seconds],
+            id=f"rest:{tg_id}", replace_existing=True, misfire_grace_time=60,
+        )
+
+    def cancel_rest(self, tg_id: int) -> None:
+        self._remove(f"rest:{tg_id}")
+
+    async def send_rest_over(self, tg_id: int, workout_id: int, ex_i: int, set_i: int, seconds: int) -> None:
+        w = await self.db.get_workout(workout_id)
+        if not w or w["status"] != "active" or w["ex_i"] != ex_i or w["set_i"] != set_i or w.get("pend_set_id"):
+            return  # человек уже идёт дальше: не мешаем
+        item = w["plan"][ex_i]
+        if item["kind"] == "weight" and w["cur_weight"] is not None:
+            goal = f"{w['cur_weight']:g} кг × {w['cur_reps']}"
+        else:
+            goal = f"{w['cur_reps']} {'сек' if item['kind'] == 'time' else 'повт.'}"
+        await self._safe_send(tg_id, f"⏰ Отдых {seconds} сек прошёл. Подход {set_i + 1}/{item['sets']}: {goal}.")
+
+    # ---------- недельный отчёт ----------
+    async def send_weekly(self, tg_id: int) -> None:
+        user = await self.db.get_user(tg_id)
+        if not user or not user["onboarded"]:
+            return
+        text = await weekly_text(self.db, user, self.llm, self.settings)
+        await self._safe_send(tg_id, text)
+
     def unschedule_user(self, tg_id: int) -> None:
         self._remove(f"wk:{tg_id}:")
         self._remove(f"sp:{tg_id}")
         self._remove(f"fu:{tg_id}:")
         self._remove(f"sn:{tg_id}:")
+        self._remove(f"rest:{tg_id}")
+        self._remove(f"wr:{tg_id}")
 
     # ---------- задачи ----------
     async def send_reminder(self, tg_id: int, workout_id: int | None = None) -> None:

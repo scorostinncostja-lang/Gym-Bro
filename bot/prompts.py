@@ -121,3 +121,8 @@ citrulline|zma|collagen|hmb|gainer|electrolytes|preworkout|fatburner|testobooste
 Informed Sport, NSF, Creapure, IFOS и т.п."], "expiry_visible": true|false, "importer_visible": true|false (данные \
 импортёра или производителя), "datamatrix_visible": true|false (код маркировки), "claims": ["завышенные обещания, \
 например «+10 кг мышц»"], "notes": "что не удалось прочитать"}."""
+
+WEEK_PROMPT = """\
+Ниже итоги недели тренировок. Напиши 3–4 предложения: что получилось, что мешает прогрессу и один \
+конкретный фокус на следующую неделю (например «закрыть все 3 тренировки» или «добавить 1 повтор в \
+базовых»). Числа бери только из фактов. Без вступлений и пустой похвалы."""

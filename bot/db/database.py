@@ -20,7 +20,9 @@ CREATE TABLE IF NOT EXISTS users (
     place TEXT,                -- основное место (по нему строится программа)
     places TEXT,               -- все доступные места: "gym,home_db,home_bw"
     equipment TEXT,            -- JSON: инвентарь дома (bot/services/equipment.py)
-    goal2 TEXT,                -- вторая цель
+    goal2 TEXT,                -- вторая цель (старое поле, дублирует goals)
+    goals TEXT,                -- все цели по приоритету: "strength,muscle,endurance"
+    rest_timer INTEGER NOT NULL DEFAULT 1,
     city TEXT,
     country TEXT,              -- RU, KZ, ...
     cardio_days TEXT,          -- дополнительные дни кардио или гибкости: "1,5"
@@ -113,7 +115,7 @@ CREATE INDEX IF NOT EXISTS ix_chat ON chat(tg_id, id);
 """
 
 USER_FIELDS = {
-    "name", "age", "height_cm", "weight_kg", "goal", "goal2", "level", "place", "places", "equipment", "city",
+    "name", "age", "height_cm", "weight_kg", "goal", "goal2", "goals", "rest_timer", "level", "place", "places", "equipment", "city",
     "country", "cardio_days", "days_per_week",
     "days", "train_time", "tz", "rotation_idx", "supp_time", "supp_remind", "onboarded",
 }
@@ -147,7 +149,8 @@ class Database:
         """Старые базы: добавляем колонки, которых ещё не было."""
         wanted = {
             "users": {"places": "TEXT", "equipment": "TEXT", "goal2": "TEXT", "city": "TEXT",
-                      "country": "TEXT", "cardio_days": "TEXT"},
+                      "country": "TEXT", "cardio_days": "TEXT", "goals": "TEXT",
+                      "rest_timer": "INTEGER NOT NULL DEFAULT 1"},
             "workouts": {"warm": "INTEGER NOT NULL DEFAULT 1"},
         }
         for table, cols in wanted.items():
@@ -224,6 +227,12 @@ class Database:
         for r in rows:
             r["data"] = json.loads(r["data"])
         return rows
+
+    async def update_product(self, product_id: int, tg_id: int, supp_id: str, brand: str | None, data: dict) -> None:
+        await self._exec(
+            "UPDATE supp_products SET supp_id=?, brand=?, data=? WHERE id=? AND tg_id=?",
+            (supp_id, brand, json.dumps(data, ensure_ascii=False), product_id, tg_id),
+        )
 
     async def set_product_price(self, product_id: int, tg_id: int, price: float) -> None:
         await self._exec("UPDATE supp_products SET price=? WHERE id=? AND tg_id=?", (price, product_id, tg_id))
@@ -388,6 +397,37 @@ class Database:
             "FROM sets WHERE tg_id=? AND weight>0 AND feel IS NOT NULL GROUP BY ex_id ORDER BY sessions DESC",
             (tg_id,),
         )
+
+    async def previous_best(self, tg_id: int, ex_id: str, exclude_set: int) -> dict | None:
+        """Лучший вес и лучшее число повторов по упражнению, без указанного подхода. None — раньше не делал."""
+        row = await self._one(
+            "SELECT MAX(weight) AS w, MAX(reps) AS r, COUNT(*) AS n FROM sets WHERE tg_id=? AND ex_id=? AND id<>?",
+            (tg_id, ex_id, exclude_set),
+        )
+        return row if row and row["n"] else None
+
+    async def sets_between(self, tg_id: int, start: str, end: str) -> list[dict]:
+        """Подходы завершённых тренировок за период [start, end] (даты ISO)."""
+        return await self._all(
+            "SELECT s.ex_id, s.weight, s.reps, s.feel, w.day FROM sets s JOIN workouts w ON w.id = s.workout_id "
+            "WHERE s.tg_id=? AND w.status='done' AND w.day BETWEEN ? AND ? ORDER BY s.id",
+            (tg_id, start, end),
+        )
+
+    async def best_before(self, tg_id: int, ex_id: str, before: str) -> float | None:
+        row = await self._one(
+            "SELECT MAX(s.weight) AS w FROM sets s JOIN workouts w ON w.id = s.workout_id "
+            "WHERE s.tg_id=? AND s.ex_id=? AND w.day < ?",
+            (tg_id, ex_id, before),
+        )
+        return row["w"] if row else None
+
+    async def done_between(self, tg_id: int, start: str, end: str) -> int:
+        row = await self._one(
+            "SELECT COUNT(*) AS c FROM workouts WHERE tg_id=? AND status='done' AND day BETWEEN ? AND ?",
+            (tg_id, start, end),
+        )
+        return row["c"] if row else 0
 
     # ---------- stats ----------
     async def streak(self, tg_id: int) -> int:

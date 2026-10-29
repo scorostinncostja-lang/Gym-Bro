@@ -113,8 +113,8 @@ async def onboard(c: Chatter, age="15", method="tape"):
 
 async def finish_onboarding(c: Chatter, places=("gym",), time_text="18:00", city="Алматы", extra="0", goal="muscle",
                             skip_country=False):
-    await c.press(Ob(act="goal", arg=goal))
-    await c.press(Ob(act="goal2", arg="-"))
+    await c.press(Ob(act="gl", arg=goal))
+    await c.press(Ob(act="gldone"))
     await c.press(Ob(act="level", arg="new"))
     for p in places:
         await c.press(Ob(act="pl", arg=p))
@@ -401,6 +401,9 @@ class StubLLM:
     async def extract_set(self, text):
         return None, None
 
+    async def ping_all(self):
+        return [("gemini-3.8-flash", False, 500, "лимит бесплатной квоты"), ("gemini-3.6-flash", True, 2100, "")]
+
 
 async def start_to_places(c: Chatter, goal_text: str | None = None):
     await c.say("/start")
@@ -411,8 +414,8 @@ async def start_to_places(c: Chatter, goal_text: str | None = None):
         await c.press(Ob(act="goal_text"))
         await c.say(goal_text)
     else:
-        await c.press(Ob(act="goal", arg="muscle"))
-        await c.press(Ob(act="goal2", arg="-"))
+        await c.press(Ob(act="gl", arg="muscle"))
+        await c.press(Ob(act="gldone"))
     await c.press(Ob(act="level", arg="new"))
 
 
@@ -443,10 +446,28 @@ async def test_home_gear_written_in_own_words_shapes_the_program(rig):
 async def test_goal_written_by_user_sets_goals(rig):
     bot, dp, db, session = rig
     c = Chatter(bot, dp)
-    await start_to_places(c, goal_text="хочу рельеф и выносливость")
+    await start_to_places(c, goal_text="Сила,объем мыщц,выносливость,рельеф\nВыглядеть большим и бегать очень быстро и долгое время")
     await finish_places_and_schedule(c)
     u = await db.get_user(1)
-    assert u["goal"] == "definition" and u["goal2"] == "endurance"
+    assert u["goals"] == "strength,muscle,endurance,definition" and u["goal"] == "strength"
+    assert any("Базовые упражнения" in t for t in session.texts())  # честно про совмещение целей
+
+
+async def test_goals_multiselect_buttons_keep_order(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await c.say("/start")
+    for v in ("15", "62", "175"):
+        await c.say(v)
+    await c.press(Ob(act="mnone"))
+    for g in ("endurance", "strength", "muscle", "flex"):
+        await c.press(Ob(act="gl", arg=g))
+    await c.press(Ob(act="gl", arg="flex"))  # снял
+    await c.press(Ob(act="gldone"))
+    await c.press(Ob(act="level", arg="new"))
+    await finish_places_and_schedule(c)
+    u = await db.get_user(1)
+    assert u["goals"] == "endurance,strength,muscle"
 
 
 async def finish_places_and_schedule(c: Chatter, extra="0", city="Алматы"):
@@ -554,8 +575,8 @@ async def test_buy_flow_asks_country_then_gives_marketplaces(rig):
     for v in ("15", "62", "175"):
         await c.say(v)
     await c.press(Ob(act="mnone"))
-    await c.press(Ob(act="goal", arg="muscle"))
-    await c.press(Ob(act="goal2", arg="-"))
+    await c.press(Ob(act="gl", arg="muscle"))
+    await c.press(Ob(act="gldone"))
     await c.press(Ob(act="level", arg="new"))
     await finish_places_and_schedule(c, city="+5")
     await c.press(Ob(act="cskip"))
@@ -592,3 +613,88 @@ async def test_supplement_reminders_split_by_time_slot(rig):
     reminders.schedule_user(await db.get_user(1))
     jobs = {j.id for j in reminders.scheduler.get_jobs()}
     assert "sp:1:am" in jobs
+
+
+async def _start_workout(c, db):
+    await c.say("/today")
+    w = await db.next_planned_workout(1)
+    await c.press(Rem(act="go", wid=w["id"]))
+    await c.press(Wk(act="warm", wid=w["id"]))
+    return w
+
+
+async def test_rest_timer_scheduled_and_cancelled(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    w = await _start_workout(c, db)
+    await c.say("40 10 нормально")
+    rem = dp.workflow_data["reminders"]
+    assert "rest:1" in {j.id for j in rem.scheduler.get_jobs()}
+    assert any("⏱ Отдых" in t for t in session.texts())
+    w = await db.get_workout(w["id"])
+    await rem.send_rest_over(1, w["id"], w["ex_i"], w["set_i"], 90)
+    assert any("Отдых 90 сек прошёл" in t for t in session.texts())
+    await c.say("40 10 нормально")  # новый подход отменяет старый таймер и ставит новый
+    n = sum("Отдых 90 сек прошёл" in t for t in session.texts())
+    await rem.send_rest_over(1, w["id"], w["ex_i"], w["set_i"], 90)  # устаревший таймер молчит
+    assert sum("Отдых 90 сек прошёл" in t for t in session.texts()) == n
+
+
+async def test_record_is_announced_on_heavier_set(rig):
+    from datetime import date
+
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    w = await _start_workout(c, db)
+    await c.say("40 10 нормально")
+    await c.say("/finish")
+    await db._exec("UPDATE workouts SET day=? WHERE id=?", (date(2020, 1, 1).isoformat(), w["id"]))  # прошлая тренировка
+    u = await db.get_user(1)
+    w2 = await dp.workflow_data["workouts"].ensure_planned(u, date.today())
+    await db.update_workout(w2["id"], plan=w["plan"])
+    await c.press(Rem(act="go", wid=w2["id"]))
+    await c.press(Wk(act="warm", wid=w2["id"]))
+    await c.say("50 10 нормально")
+    assert any("🏆 Рекорд" in t and "50 кг" in t for t in session.texts())
+
+
+async def test_week_report_and_ai_status(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await _start_workout(c, db)
+    await c.say("40 10 нормально")
+    await c.say("/finish")
+    dp.workflow_data["llm"] = StubLLM("Хорошая неделя. Фокус: закрыть все 3 тренировки.")
+    await c.say("/week")
+    text = next(t for t in session.texts() if "Итоги недели" in t)
+    assert "Тренировок: 1 из 3" in text and "Тренер" in text
+    await c.say("/ai")
+    status = next(t for t in session.texts() if "Модели ИИ" in t)
+    assert "лимит бесплатной квоты" in status and "Работают 1 из 2" in status
+    assert "wr:1" in {j.id for j in dp.workflow_data["reminders"].scheduler.get_jobs()}
+
+
+async def test_extra_photos_update_same_product(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import Sup
+    dp.workflow_data["llm"] = StubLLM(json.dumps({
+        "readable": True, "kind": "whey", "brand": "Optimum Nutrition", "product": "Gold Standard",
+        "per_serving": {}, "certs": [], "expiry_visible": False}))
+    await c.press(Sup(act="have"))
+    await c.say("Optimum Nutrition Gold Standard Whey")
+    pid = (await db.products(1))[0]["id"]
+    assert any("Не видно на фото" in t for t in session.texts())
+    dp.workflow_data["llm"] = StubLLM(json.dumps({
+        "readable": True, "kind": "whey", "serving_g": 30, "servings": 70,
+        "per_serving": {"protein_g": 24}, "certs": ["Informed Sport"], "expiry_visible": True}))
+    await c.press(Sup(act="more", id=str(pid)))
+    await c.say("Serving 30 g, protein 24 g, 70 servings, Informed Sport")
+    products = await db.products(1)
+    assert len(products) == 1 and products[0]["data"]["per_serving"]["protein_g"] == 24
+    assert products[0]["data"]["brand"] == "Optimum Nutrition"
+    assert any("🟢" in t for t in session.texts())

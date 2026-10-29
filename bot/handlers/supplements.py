@@ -17,7 +17,7 @@ from bot.prompts import LABEL_PROMPT, SUPP_COMMENT_PROMPT, system_prompt
 from bot.services.guard import MINOR_AGE
 from bot.services.llm import LLM, LLMError, Media
 from bot.services.location import country_of, parse_location
-from bot.services.supp_label import evaluate, parse_label_json, render
+from bot.services.supp_label import evaluate, merge_labels, parse_label_json, render, render_price
 from bot.services.supp_shop import TIERS, buyable_for, recommend
 from bot.services.profile import build_profile
 from bot.services.reminders import Reminders
@@ -351,19 +351,21 @@ async def on_analyze(cb: CallbackQuery, state: FSMContext, db: Database, llm: LL
     if not data.get("media"):
         await cb.message.answer("Фото пока нет. Пришли снимок банки или напиши состав текстом.")
         return
-    await _analyze(cb.message, cb.from_user.id, data["media"], None, state, db, llm, settings)
+    await _analyze(cb.message, cb.from_user.id, data["media"], None, state, db, llm, settings, data.get("pid"))
 
 
 @router.message(SuppFlow.photos, F.text, ~F.text.startswith("/"))
 async def on_label_text(message: Message, state: FSMContext, db: Database, llm: LLM, settings: Settings):
     data = await state.get_data()
-    await _analyze(message, message.from_user.id, data.get("media", []), message.text, state, db, llm, settings)
+    await _analyze(message, message.from_user.id, data.get("media", []), message.text, state, db, llm, settings,
+                   data.get("pid"))
 
 
 async def _analyze(
     message: Message, uid: int, file_ids: list[str], text: str | None, state: FSMContext,
-    db: Database, llm: LLM, settings: Settings,
+    db: Database, llm: LLM, settings: Settings, pid: int | None = None,
 ) -> None:
+    """Разбор этикетки. pid: дослали фото к уже разобранной банке, данные объединяются."""
     user = await db.get_user(uid)
     assert user
     if not llm.available:
@@ -391,16 +393,37 @@ async def _analyze(
     if not label:
         await message.answer("Не смог разобрать ответ. Пришли более чёткое фото состава или напиши его текстом.")
         return
+    old = next((p for p in await db.products(uid) if p["id"] == pid), None) if pid else None
+    if old:
+        label = merge_labels(old["data"], label)
     verdict = evaluate(label, user)
-    pid = await db.add_product(uid, verdict.supp_id, label.get("brand"), label)
+    if old:
+        await db.update_product(old["id"], uid, verdict.supp_id, label.get("brand"), label)
+        pid = old["id"]
+    else:
+        pid = await db.add_product(uid, verdict.supp_id, label.get("brand"), label)
     if verdict.supp_id in supplements():
         await db.stack_add(uid, verdict.supp_id)
     await state.clear()
     rows = [[("💰 Указать цену", Sup(act="price", id=str(pid)))]]
+    if verdict.missing:
+        rows.insert(0, [("📸 Дослать фото", Sup(act="more", id=str(pid)))])
     if verdict.supp_id in supplements():
         rows.append([("🧮 Мой план приёма", Sup(act="plan"))])
     rows.append([("➕ Проверить ещё одну", Sup(act="have"))])
     await message.answer(render(verdict), reply_markup=inline(rows))
+
+
+@router.callback_query(Sup.filter(F.act == "more"))
+async def on_more_photos(cb: CallbackQuery, callback_data: Sup, state: FSMContext):
+    await cb.answer()
+    await state.set_state(SuppFlow.photos)
+    await state.set_data({"media": [], "pid": int(callback_data.id)})
+    await cb.message.answer(
+        "Пришли фото обратной стороны: таблица состава (Supplement Facts / Пищевая ценность), срок годности, "
+        "данные импортёра. Дополню прошлый разбор.",
+        reply_markup=_cancel_kb(),
+    )
 
 
 @router.callback_query(Sup.filter(F.act == "price"))
@@ -427,7 +450,7 @@ async def on_price_value(message: Message, state: FSMContext, db: Database):
         await message.answer("Не нашёл эту добавку. Пришли фото заново.")
         return
     await db.set_product_price(prod["id"], message.from_user.id, price)
-    await message.answer(render(evaluate(prod["data"], user), price))
+    await message.answer(render_price(evaluate(prod["data"], user), prod["data"], price))
 
 
 # ---------- планирую купить: что и где ----------

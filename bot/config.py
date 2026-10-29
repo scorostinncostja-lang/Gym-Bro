@@ -23,7 +23,10 @@ class Settings(BaseSettings):
 
     # Имена моделей меняются у провайдеров часто, поэтому только через .env.
     gemini_model: str = "gemini-3.8-flash"
-    gemini_fallback_model: str = "gemini-3.6-flash"  # если основная перегружена (503)
+    gemini_fallback_model: str = ""  # устаревшая настройка: одна запасная модель, встаёт первой в цепочку
+    # Запасные модели Gemini по порядку. У бесплатного тарифа у каждой своя дневная квота, поэтому
+    # цепочка из нескольких моделей держит бота живым, когда основная упёрлась в лимит.
+    gemini_fallback_models: Annotated[list[str], NoDecode] = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3-flash-preview"]
     groq_llm_model: str = DEFAULT_GROQ_LLM
     groq_vision_model: str = DEFAULT_GROQ_VISION
     groq_stt_model: str = "whisper-large-v3-turbo"
@@ -47,6 +50,13 @@ class Settings(BaseSettings):
     def _split_ids(cls, v):
         if isinstance(v, str):
             return [int(x) for x in v.replace(" ", "").split(",") if x]
+        return v
+
+    @field_validator("gemini_fallback_models", mode="before")
+    @classmethod
+    def _split_models(cls, v):
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
         return v
 
 

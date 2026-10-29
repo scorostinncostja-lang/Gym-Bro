@@ -7,6 +7,7 @@ from bot.db.database import Database
 from bot.services.exercise_db import ExerciseDB
 from bot.data import flex_template
 from bot.services import equipment
+from bot.services.goals import user_goals
 from bot.services.program_builder import alternatives, build_day, build_extra_day, make_item, template_for
 from bot.services.progression import Feel, SetResult, Target, next_target, set_hint
 from bot.services.start_weights import start_weight
@@ -18,12 +19,14 @@ from bot.services.set_parser import ParsedSet
 class SetOutcome:
     hint_text: str
     state: str  # next_set | next_ex | finished
+    feel: int | None = None
 
 
 class WorkoutService:
     def __init__(self, db: Database, edb: ExerciseDB):
         self.db = db
         self.edb = edb
+        self.reminders = None  # Reminders: таймер отдыха; задаётся в build_dispatcher
 
     async def ensure_planned(self, user: dict, day: date) -> dict:
         """План на день: берём существующий или собираем по шаблону."""
@@ -118,6 +121,21 @@ class WorkoutService:
         await self.db.update_workout(w["id"], pend_set_id=set_id)
         return set_id, None
 
+    async def record_note(self, tg_id: int, item: dict, weight: float, reps: int, set_id: int) -> str | None:
+        """«🏆 Рекорд», если подход лучше всех прошлых по этому упражнению."""
+        prev = await self.db.previous_best(tg_id, item["ex_id"], set_id)
+        if not prev:
+            return None  # первый раз — не рекорд, а старт
+        ex = get_exercise(item["ex_id"])
+        name = ex.name if ex else item["ex_id"]
+        fmt = lambda x: f"{x:g}"  # noqa: E731
+        if item["kind"] == "weight" and weight > (prev["w"] or 0):
+            return f"🏆 Рекорд в «{name}»: {fmt(weight)} кг (было {fmt(prev['w'] or 0)})!"
+        if item["kind"] in ("reps", "time", "cardio") and reps > (prev["r"] or 0):
+            unit = {"reps": "повт.", "time": "сек", "cardio": "мин"}[item["kind"]]
+            return f"🏆 Рекорд в «{name}»: {reps} {unit} (было {prev['r']})!"
+        return None
+
     async def complete_set(self, workout_id: int, set_id: int, feel: Feel) -> SetOutcome:
         w = await self.db.get_workout(workout_id)
         s = await self.db.get_set(set_id)
@@ -138,8 +156,8 @@ class WorkoutService:
                 cur_weight=hint.next_weight if hint.next_weight is not None else w["cur_weight"],
                 cur_reps=hint.next_reps,
             )
-            return SetOutcome(hint.text, "next_set")
-        return SetOutcome(hint.text, await self._next_exercise(workout_id))
+            return SetOutcome(hint.text, "next_set", int(feel))
+        return SetOutcome(hint.text, await self._next_exercise(workout_id), int(feel))
 
     async def skip_exercise(self, workout_id: int) -> str:
         return await self._next_exercise(workout_id)
@@ -168,7 +186,7 @@ class WorkoutService:
         if not alts:
             return False
         ex = alts[0]
-        w["plan"][w["ex_i"]] = make_item(ex, item["sets"], user.get("goal"), user.get("age")).to_dict()
+        w["plan"][w["ex_i"]] = make_item(ex, item["sets"], user_goals(user), user.get("age")).to_dict()
         await self.db.update_workout(workout_id, plan=w["plan"])
         await self.enter_exercise(workout_id)
         return True

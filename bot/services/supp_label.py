@@ -21,6 +21,8 @@ class Verdict:
     headline: str = ""
     good: list[str] = field(default_factory=list)
     flags: list[str] = field(default_factory=list)
+    info: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
     dose: str = ""
     supply: str = ""
     supp_id: str = "other"
@@ -41,6 +43,34 @@ def parse_label_json(raw: str) -> dict | None:
 
 def _num(x) -> float | None:
     return float(x) if isinstance(x, (int, float)) and not isinstance(x, bool) and x >= 0 else None
+
+
+def merge_labels(old: dict, new: dict) -> dict:
+    """Досланные фото дополняют прошлый разбор: новое значение важнее, пустое не затирает старое."""
+    out = dict(old)
+    for k, v in new.items():
+        if k == "per_serving" and isinstance(v, dict):
+            per = dict(old.get("per_serving") or {})
+            per.update({pk: pv for pk, pv in v.items() if pv is not None})
+            out[k] = per
+        elif isinstance(v, list):
+            out[k] = list(dict.fromkeys([*(old.get(k) or []), *v]))
+        elif isinstance(v, bool):
+            out[k] = v or bool(old.get(k))
+        elif v not in (None, ""):
+            out[k] = v
+    out["readable"] = bool(old.get("readable")) or bool(new.get("readable"))
+    return out
+
+
+def split_certs(certs: list[str]) -> tuple[list[str], list[str]]:
+    """Настоящие знаки независимой проверки и прочие надписи вроде GMP, ISO, HACCP."""
+    patterns = shops_data()["cert_patterns"]
+    real, other = [], []
+    for c in certs:
+        name = next((n for n, pat in patterns.items() if re.search(pat, c, re.I)), None)
+        (real if name else other).append(name or c)
+    return list(dict.fromkeys(real)), list(dict.fromkeys(other))
 
 
 def _brand_trust(brand: str | None, text: str) -> tuple[str, str | None]:
@@ -67,7 +97,7 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
     servings = _num(label.get("servings"))
     net = _num(label.get("net_g"))
     brand = label.get("brand")
-    certs = [c for c in (label.get("certs") or []) if isinstance(c, str)]
+    certs, other_marks = split_certs([c for c in (label.get("certs") or []) if isinstance(c, str)])
     stimulants = [x for x in (label.get("stimulants") or []) if isinstance(x, str)]
 
     def red(msg: str):
@@ -103,12 +133,19 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
     if claims:
         yellow("Громкие обещания на упаковке («" + claims[0][:60] + "»): честные добавки так не пишут.")
     if label.get("expiry_visible") is False:
-        yellow("Срок годности не виден. Проверь его на банке до покупки или приёма.")
+        v.missing.append("срок годности")
     if label.get("importer_visible") is False:
-        yellow("Не вижу данных импортёра или производителя. На легальной банке они есть.")
+        v.missing.append("данные импортёра или производителя")
+    if other_marks:
+        v.info.append(
+            "«" + ", ".join(other_marks[:3]) + "» — это заявление о стандартах производства, а не независимая "
+            "проверка этой банки."
+        )
 
     # --- бренд и сертификаты
     trust, note = _brand_trust(brand, str(label.get("product") or ""))
+    name_text = f"{label.get('product') or ''} {label.get('brand') or ''}".lower()
+    pure_creatine = kind == "creatine" and bool(re.search(r"100\s*%|monohydrate|моногидрат", name_text))
     if certs:
         v.good.append("Есть знак независимой проверки: " + ", ".join(certs[:3])
                       + ". Проверь серию (lot) на сайте сертификатора, значок можно подделать.")
@@ -118,7 +155,9 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
             yellow("На этой банке знака независимой проверки не вижу: у бренда он есть не на всех продуктах.")
     elif trust == "big":
         v.good.append(note or "")
-        if not certs:
+        if not certs and pure_creatine:
+            v.info.append("Независимой проверки партии нет, но чистый моногидрат известного бренда — низкий риск.")
+        elif not certs:
             yellow("Независимую проверку партии подтвердить не могу.")
     elif not certs:
         yellow(
@@ -133,6 +172,9 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
 
     if kind == "creatine":
         cr = _num(per.get("creatine_g"))
+        if cr is None and pure_creatine and serving:
+            cr = serving  # «100% моногидрат»: вся порция — креатин
+            v.info.append(f"По названию «100% моногидрат» считаю, что в порции {serving:g} г креатина.")
         target = float(re.search(r"[\d.,]+", plan_line.dose).group(0).replace(",", ".")) if plan_line and plan_line.dose else 3.0
         if cr and cr > 0:
             daily_servings = target / cr
@@ -140,7 +182,7 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
             if serving and cr / serving < 0.8:
                 yellow("Креатина в порции меньше 80% от её веса: в банке много добавок. Бери чистый моногидрат.")
         else:
-            yellow("Не вижу, сколько креатина в порции: посчитать твою дозу нельзя.")
+            v.missing.append("сколько креатина в порции")
     elif kind == "whey":
         pr = _num(per.get("protein_g"))
         if pr and serving:
@@ -153,6 +195,8 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
             daily_servings = 1.0 if (not adult or (plan_line and plan_line.dose.startswith("1 ")) ) else 2.0
             dose_text = f"По твоему плану {daily_servings:g} порц. в день (≈{daily_servings * pr:g} г белка)."
             v.protein_per_day_g = daily_servings * pr
+        else:
+            v.missing.append("белок в порции и вес порции")
         sugar = _num(per.get("sugar_g"))
         if sugar and serving and sugar / serving > 0.1:
             yellow(f"Сахара {sugar:g} г в порции: для протеина многовато.")
@@ -164,7 +208,7 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
             daily_servings = float(caps)
             dose_text = f"Твоя норма ≈ {target:g} мг EPA+DHA = {caps} порц. в день (в порции {epa:g} мг)."
         else:
-            yellow("Не вижу EPA+DHA в порции: «1000 мг рыбьего жира» значит только 300 мг полезных кислот.")
+            v.missing.append("EPA+DHA в порции (не путай с «1000 мг рыбьего жира»)")
     elif kind == "vitd":
         iu = _num(per.get("vitd_iu"))
         if iu and iu > 0:
@@ -175,7 +219,7 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
                 daily_servings = max(0.5, round(target / iu * 2) / 2)
                 dose_text = f"Твоя доза ≈ {target:g} МЕ = {daily_servings:g} порц. в день (в порции {iu:g} МЕ)."
         else:
-            yellow("Не вижу дозу витамина D в МЕ или мкг.")
+            v.missing.append("доза витамина D в МЕ или мкг")
 
     v.dose = dose_text
     if daily_servings and servings:
@@ -197,16 +241,42 @@ def render(v: Verdict, price: float | None = None) -> str:
         lines += ["", "<b>Хорошо</b>"] + [f"• {html.escape(g)}" for g in v.good if g]
     if v.flags:
         lines += ["", "<b>Вопросы</b>"] + [f"• {html.escape(f)}" for f in v.flags]
+    if v.info:
+        lines += [""] + [f"ℹ️ {html.escape(i)}" for i in v.info]
+    if v.missing:
+        lines += ["", "📸 <b>Не видно на фото:</b> " + html.escape(", ".join(v.missing))
+                  + ". Дошли фото обратной стороны (состав, срок годности), и я дополню разбор."]
     if v.dose:
         lines += ["", "<b>Тебе</b>", html.escape(v.dose) + (" " + html.escape(v.supply) if v.supply else "")]
-    if price and v.days_supply:
-        lines.append(f"Цена: {price:,.0f} за упаковку, ≈ {price / v.days_supply:,.0f} в день.".replace(",", " "))
-        if v.protein_per_day_g:
-            per100 = price / (v.days_supply * v.protein_per_day_g) * 100
-            lines.append(f"За 100 г чистого белка: ≈ {per100:,.0f}. Сравни с другими банками по этому числу.".replace(",", " "))
     lines.append("\n<i>Я читаю только то, что видно на фото. Подлинность банки и качество партии проверить не могу: "
                  "сверяй серию на сайте сертификатора и покупай у проверенного продавца.</i>")
     return "\n".join(lines)
+
+
+def _money(x: float) -> str:
+    return f"{x:,.0f}".replace(",", " ")
+
+
+def render_price(v: Verdict, label: dict, price: float) -> str:
+    """Короткий ответ на цену: всё, что можно посчитать из этикетки."""
+    servings = _num(label.get("servings"))
+    net = _num(label.get("net_g"))
+    serving = _num(label.get("serving_g"))
+    if not servings and net and serving:
+        servings = net / serving
+    rows = [f"💰 <b>Цена: {_money(price)} за упаковку</b>"]
+    if servings:
+        rows.append(f"• Порция: ≈ {_money(price / servings)} ({servings:.0f} порций в банке)")
+    if v.days_supply:
+        rows.append(f"• В день по твоему плану: ≈ {_money(price / v.days_supply)} (хватит на {v.days_supply:.0f} дн.)")
+    if v.protein_per_day_g and v.days_supply:
+        rows.append(f"• За 100 г чистого белка: ≈ {_money(price / (v.days_supply * v.protein_per_day_g) * 100)}. "
+                    "Сравнивай банки по этому числу.")
+    elif net:
+        rows.append(f"• За 100 г продукта: ≈ {_money(price / net * 100)}")
+    if len(rows) == 1:
+        rows.append("Не вижу ни числа порций, ни веса банки. Дошли фото состава, и я посчитаю цену за порцию.")
+    return "\n".join(rows)
 
 
 def supply_days(servings: float | None, daily: float | None) -> float | None:

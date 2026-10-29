@@ -25,6 +25,7 @@ COMMANDS = [
     BotCommand(command="today", description="Тренировка сегодня"),
     BotCommand(command="plan", description="Моя программа"),
     BotCommand(command="stats", description="Прогресс и серия"),
+    BotCommand(command="week", description="Итоги недели"),
     BotCommand(command="measure", description="Новые замеры (лента, фото, кружок)"),
     BotCommand(command="progress", description="Фото «было → стало»"),
     BotCommand(command="photo_guide", description="Как снимать фото и кружок"),
@@ -33,6 +34,7 @@ COMMANDS = [
     BotCommand(command="library", description="Каталог упражнений"),
     BotCommand(command="settings", description="Настройки"),
     BotCommand(command="help", description="Помощь"),
+    BotCommand(command="ai", description="Проверить модели ИИ"),
     BotCommand(command="privacy", description="Какие данные я храню"),
     BotCommand(command="delete_me", description="Удалить мои данные"),
 ]
@@ -72,6 +74,7 @@ def build_dispatcher(*, settings, db, edb, llm, workouts, reminders) -> Dispatch
         storage=MemoryStorage(), db=db, edb=edb, llm=llm, settings=settings,
         workouts=workouts, reminders=reminders,
     )
+    workouts.reminders = reminders  # таймер отдыха между подходами
     access = AccessMiddleware(settings.allowed_user_ids)
     serial = UserSerialMiddleware()
     dp.message.outer_middleware(access)
@@ -110,6 +113,7 @@ async def run() -> None:
     workouts = WorkoutService(db, edb)
     reminders = Reminders(bot, db, workouts)
     llm = LLM(settings)
+    reminders.llm, reminders.settings = llm, settings
 
     dp = build_dispatcher(
         settings=settings, db=db, edb=edb, llm=llm, workouts=workouts, reminders=reminders

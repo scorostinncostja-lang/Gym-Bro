@@ -10,7 +10,7 @@ from bot.data import supplements
 from bot.services.supp_advice import teen_ok
 
 ADULT_AGE = 18
-from bot.services.goals import goal_name, protein_per_kg
+from bot.services.goals import goals_label, protein_per_kg, user_goals
 
 STATUS_TITLE = {
     "take": "✅ <b>Принимай</b>",
@@ -35,7 +35,7 @@ class Plan:
     lines: list[PlanLine]
     weight: float
     age: int
-    goal: str
+    goal: list[str]
     protein: tuple[int, int]  # диапазон г белка в день
     train_time: str | None
     adult: bool
@@ -53,12 +53,12 @@ def _first_sentence(text: str) -> str:
     return text.split(". ")[0].rstrip(".") + "."
 
 
-def _protein_range(weight: float, goal: str, adult: bool) -> tuple[int, int]:
+def _protein_range(weight: float, goal: list[str], adult: bool) -> tuple[int, int]:
     gpk = protein_per_kg(goal) if adult else min(protein_per_kg(goal), 1.6)  # подросткам без верхних значений
     return round(weight * (gpk - 0.2) / 5) * 5, round(weight * (gpk + 0.2) / 5) * 5
 
 
-def _line(s: dict, adult: bool, weight: float, goal: str) -> PlanLine:
+def _line(s: dict, adult: bool, weight: float, goal: list[str]) -> PlanLine:
     sid, name, verdict = s["id"], s["name"].split(" (")[0], s["verdict"]
     t = s["teen"]
 
@@ -77,7 +77,7 @@ def _line(s: dict, adult: bool, weight: float, goal: str) -> PlanLine:
             dose = f"{grams:g} г в день"
         else:
             dose = "3 г в день (мерная ложка из банки)"
-        weak = goal in ("endurance", "flex")
+        weak = bool(goal) and set(goal) <= {"endurance", "flex", "fit"}
         return PlanLine(
             sid, name, "maybe" if weak else "take", dose + ", без «загрузки»",
             "каждый день, и в дни отдыха тоже; с любой едой, можно после тренировки",
@@ -119,7 +119,7 @@ def build_plan(user: dict, owned: list[str]) -> Plan:
     weight = float(user.get("weight_kg") or 60)
     age = int(user.get("age") or 0)
     adult = age >= ADULT_AGE
-    goal = user.get("goal") or "fit"
+    goal = user_goals(user)
     lines = [_line(sup[sid], adult, weight, goal) for sid in owned if sid in sup]
     order = {"take": 0, "maybe": 1, "skip": 2, "avoid": 3}
     lines.sort(key=lambda ln: order[ln.status])
@@ -146,7 +146,7 @@ def _timeline(plan: Plan) -> list[str]:
 def render_plan(plan: Plan) -> str:
     head = (
         f"🧮 <b>План приёма добавок</b>\n"
-        f"Рассчитано на {plan.weight:g} кг, {plan.age} лет, цель: {goal_name(plan.goal)}."
+        f"Рассчитано на {plan.weight:g} кг, {plan.age} лет, цели: {goals_label(plan.goal)}."
     )
     if not plan.lines:
         return head + "\n\nНабор пуст. Отметь, что у тебя есть: /supplements"
@@ -179,7 +179,7 @@ def render_plan(plan: Plan) -> str:
 
 def plan_facts(plan: Plan) -> str:
     """Для ИИ: готовый план в виде текста, числа менять нельзя."""
-    rows = [f"Вес {plan.weight:g} кг, возраст {plan.age}, цель {goal_name(plan.goal)}."]
+    rows = [f"Вес {plan.weight:g} кг, возраст {plan.age}, цели {goals_label(plan.goal)}."]
     for ln in plan.lines:
         rows.append(f"- {ln.name} [{ln.status}] {ln.dose} {ln.when} {ln.note}".strip())
     return "\n".join(rows)

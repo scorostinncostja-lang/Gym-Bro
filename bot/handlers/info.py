@@ -1,5 +1,6 @@
 """План, прогресс, справочник упражнений, настройки, приватность."""
 import html
+import time
 from datetime import timedelta
 
 from aiogram import F, Router
@@ -10,13 +11,16 @@ from urllib.parse import quote_plus
 from aiogram.types import CallbackQuery, Message
 
 from bot.cards import send_animation, send_exercise_media, steps_text
+from bot.config import Settings
 from bot.data import find_exercises, get_exercise
 from bot.db.database import Database
 from bot.handlers.onboarding import MEASURE_LABELS, MEASURE_UNITS
 from bot.data import program_templates
 from bot.services.exercise_db import ExerciseDB
+from bot.services.llm import LLM
+from bot.services.report import weekly_text
 from bot.services.equipment import item_label, load_gear
-from bot.services.goals import goal_name
+from bot.services.goals import goals_label, user_goals
 from bot.services.location import COUNTRY_NAME
 from bot.services.places import places_label, user_places
 from bot.services.program_builder import build_day
@@ -34,12 +38,14 @@ HELP = """\
 🏋️ /today — тренировка сегодня: в зале или дома, место меняется кнопкой
 📅 /plan — твоя программа
 📊 /stats — прогресс, серия, рабочие веса
+📈 /week — итоги недели с разбором (приходят сами по воскресеньям)
 📏 /measure — замеры: лента, фото или кружок
 📸 /progress — фото «было → стало», /photo_guide — как снимать
 💊 /supplements — проверю добавку по фото, посчитаю дозы по весу, подскажу, что и где купить
 🔎 /exercise присед — анимация и техника (русский или английский)
 📚 /library — каталог упражнений по группам мышц
 ⚙️ /settings — цель, места, инвентарь, расписание, кардио, город
+🤖 /ai — проверить, работают ли модели ИИ
 🔒 /privacy — какие данные я храню
 🗑 /delete_me — удалить все данные
 
@@ -73,6 +79,56 @@ PRIVACY = """\
 @router.message(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(HELP)
+
+
+_AI_PING_EVERY = 300  # не чаще раза в 5 минут на человека: каждая проверка тратит квоту
+_ai_last: dict[int, float] = {}
+
+
+@router.message(Command("ai"))
+async def cmd_ai(message: Message, llm: LLM):
+    """Проверка всех моделей ИИ: какие отвечают и как быстро."""
+    if not llm.available:
+        await message.answer("ИИ не подключён: в .env нет GEMINI_API_KEY и GROQ_API_KEY.")
+        return
+    now = time.monotonic()
+    if now - _ai_last.get(message.from_user.id, -1e9) < _AI_PING_EVERY:
+        await message.answer("Проверял недавно. Повтори через пару минут.")
+        return
+    _ai_last[message.from_user.id] = now
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    rows = await llm.ping_all()
+    lines = ["🤖 <b>Модели ИИ</b>"]
+    for name, ok, ms, err in rows:
+        lines.append(f"{'✅' if ok else '❌'} {html.escape(name)}: " + (f"{ms / 1000:.1f} с" if ok else html.escape(err)))
+    alive = sum(1 for _, ok, _, _ in rows if ok)
+    lines.append(
+        f"\nРаботают {alive} из {len(rows)}. Бот сам берёт первую живую модель, упавшие отдыхают: "
+        "лимит квоты — несколько часов, перегрузка — пару минут."
+        if alive else "\nНи одна модель не ответила. Проверь ключи в .env и интернет на сервере."
+    )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("week"))
+async def cmd_week(message: Message, db: Database, llm: LLM, settings: Settings):
+    user = await db.get_user(message.from_user.id)
+    if not user or not user["onboarded"]:
+        await message.answer("Сначала анкета: /start")
+        return
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    await message.answer(await weekly_text(db, user, llm, settings))
+
+
+@router.callback_query(St.filter(F.act == "rest"))
+async def settings_rest(cb: CallbackQuery, db: Database):
+    user = await db.get_user(cb.from_user.id)
+    if not user:
+        await cb.answer()
+        return
+    new = 0 if user.get("rest_timer", 1) else 1
+    await db.update_user(cb.from_user.id, rest_timer=new)
+    await cb.answer("Таймер отдыха включён" if new else "Таймер отдыха выключен", show_alert=False)
 
 
 @router.message(Command("privacy"))
@@ -278,23 +334,24 @@ async def cmd_settings(message: Message, db: Database):
     if not user or not user["onboarded"]:
         await message.answer("Сначала анкета: /start")
         return
-    goal = goal_name(user["goal"]) + (f" + {goal_name(user['goal2'])}" if user.get("goal2") else "")
+    goal = goals_label(user_goals(user))
     gear = load_gear(user)
     extra = parse_days(user.get("cardio_days"))
     where = ", ".join(x for x in (user.get("city"), COUNTRY_NAME.get(user.get("country") or "")) if x) or "не указан"
     await message.answer(
         "⚙️ <b>Настройки</b>\n"
-        f"Цель: {goal}\n"
+        f"Цели: {goal}\n"
         f"Места: {places_label(user_places(user))}\n"
         f"Инвентарь дома: {', '.join(item_label(i) for i in gear['items']) or 'не указан'}\n"
         f"Расписание: {fmt_days(parse_days(user['days']))} в {user['train_time']}\n"
         f"Кардио или гибкость: {fmt_days(extra) if extra else 'нет'}\n"
         f"Город: {where} ({user['tz']})",
         reply_markup=inline([
-            [("🎯 Цель", St(act="goal")), ("📍 Места", St(act="place"))],
+            [("🎯 Цели", St(act="goal")), ("📍 Места", St(act="place"))],
             [("🧰 Инвентарь", St(act="gear")), ("📆 Расписание", St(act="sched"))],
             [("🏃 Кардио и гибкость", St(act="extra")), ("🌍 Город и пояс", St(act="tz"))],
-            [("📏 Замеры", St(act="meas")), ("🗑 Удалить мои данные", St(act="del"))],
+            [("📏 Замеры", St(act="meas")), (f"⏱ Таймер отдыха: {'вкл' if user.get('rest_timer', 1) else 'выкл'}", St(act="rest"))],
+            [("🗑 Удалить мои данные", St(act="del"))],
         ]),
     )
 

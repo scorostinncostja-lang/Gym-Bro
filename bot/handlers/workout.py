@@ -17,6 +17,7 @@ from bot.services.debrief import template_debrief, workout_facts
 from bot.services.llm import LLM, LLMError
 from bot.services import cardio as cardio_svc
 from bot.services import equipment
+from bot.services.goals import rest_seconds, user_goals
 from bot.services.places import user_places
 from bot.services.profile import build_profile
 from bot.services.progression import FEEL_LABELS, Feel
@@ -174,7 +175,14 @@ async def after_outcome(
     assert w
     head = (f"{logged}\n" if logged else "") + f"💬 {outcome.hint_text}"
     if outcome.state == "next_set":
-        await msg.answer(head + "\n\n" + set_prompt(w, w["plan"][w["ex_i"]]))
+        item = w["plan"][w["ex_i"]]
+        user = await db.get_user(w["tg_id"])
+        if user and user.get("rest_timer", 1) and workouts.reminders and item["kind"] != "cardio":
+            ex = get_exercise(item["ex_id"])
+            secs = rest_seconds(user_goals(user), item["kind"], ex.pattern if ex else None, outcome.feel)
+            workouts.reminders.schedule_rest(w["tg_id"], w["id"], w["ex_i"], w["set_i"], secs)
+            head += f"\n⏱ Отдых {secs} сек, напомню."
+        await msg.answer(head + "\n\n" + set_prompt(w, item))
     elif outcome.state == "next_ex":
         await msg.answer(head + "\n\n➡ Следующее упражнение.")
         await show_exercise(msg, w, workouts)
@@ -213,6 +221,8 @@ async def finish_workout(
 ) -> None:
     user = await db.get_user(w["tg_id"])
     assert user
+    if workouts.reminders:
+        workouts.reminders.cancel_rest(w["tg_id"])
     res = await workouts.finish(user, w["id"], _now(), completed=not early)
     if res["sets"] == 0:
         await msg.answer("Подходов не записано, тренировка не засчитана. Вернуться можно в любой момент: «Тренировка».")
@@ -423,6 +433,8 @@ async def process_set_text(
     """Пытается принять текст как подход или самочувствие. False = это не про тренировку (пусть отвечает чат)."""
     item = w["plan"][w["ex_i"]]
     has_digits = any(c.isdigit() for c in text)
+    if workouts.reminders:
+        workouts.reminders.cancel_rest(w["tg_id"])  # человек уже пишет: таймер отдыха не нужен
     if not w.get("warm", 1):
         await db.update_workout(w["id"], warm=1)  # человек уже работает: разминку не навязываем
     if mentions_pain(text) and len(text) < 160:
@@ -464,18 +476,20 @@ async def process_set_text(
             return True
         return False
 
-    _, outcome = await workouts.log_set(w, parsed)
+    set_id, outcome = await workouts.log_set(w, parsed)
     logged = f"✔ {fmt_set(item['kind'], parsed.weight, parsed.reps)}"
+    record = await workouts.record_note(w["tg_id"], item, parsed.weight, parsed.reps, set_id)
     if outcome is not None:
         await after_outcome(
             message, w["id"], outcome, db, workouts, llm, settings,
-            logged=f"{logged} · {FEEL_LABELS[parsed.feel]}",
+            logged=f"{logged} · {FEEL_LABELS[parsed.feel]}" + (f"\n{record}" if record else ""),
         )
         return True
     fresh = await db.get_workout(w["id"])
     assert fresh
     await message.answer(
-        f"{logged}. Как далось?\n<i>Нажми кнопку или напиши словами: «легко», «еле дожал».</i>",
+        (f"{record}\n" if record else "")
+        + f"{logged}. Как далось?\n<i>Нажми кнопку или напиши словами: «легко», «еле дожал».</i>",
         reply_markup=feel_keyboard(w["id"], fresh["pend_set_id"]),
     )
     return True
