@@ -90,9 +90,11 @@ def test_parse_set_uses_default_weight_and_feel():
 # ---------- программа ----------
 @pytest.mark.parametrize("days", [2, 3, 4])
 @pytest.mark.parametrize("place", list(PLACES))
-def test_every_day_is_buildable_and_respects_equipment(days, place):
+@pytest.mark.parametrize("goal", ["muscle", "strength", "definition", "endurance", "flex", "fit"])
+def test_every_day_is_buildable_and_respects_equipment(days, place, goal):
+    user = {"place": place, "level": "new", "goal": goal, "age": 15}
     for i in range(len(program_templates(days)) * 2):
-        plan = build_day(template_for(days, i), place)
+        plan = build_day(template_for(days, i), user)
         assert len(plan) >= 4, (days, place, i)
         ids = [p.ex_id for p in plan]
         assert len(ids) == len(set(ids))
@@ -102,15 +104,15 @@ def test_every_day_is_buildable_and_respects_equipment(days, place):
 
 
 def test_alternatives_exclude_current_and_stay_in_family():
-    alts = alternatives("pushup", "home_bw", {"pushup"})
+    alts = alternatives("pushup", {"place": "home_bw", "level": "new"}, "home_bw", {"pushup"})
     assert alts and all(a.id != "pushup" for a in alts)
 
 
 def test_catalog_integrity():
     for e in exercises().values():
-        assert e.cues and e.fedb
+        assert e.cues
         assert e.hasan is None or e.hasan.isdigit()
-        assert e.kind in {"weight", "reps", "time"}
+        assert e.kind in {"weight", "reps", "time", "cardio"}
 
 
 # ---------- безопасность ----------
@@ -287,5 +289,10 @@ def test_every_exercise_card_fits_one_caption():
         item = {"ex_id": ex.id, "sets": 4, "lo": lo, "hi": hi, "kind": ex.kind, "step": ex.step}
         w = {"ex_i": 5, "plan": [item] * 6, "set_i": 0, "cur_weight": 102.5, "cur_reps": hi}
         last = [{"weight": 102.5, "reps": hi}] * 4
-        text = exercise_text(w, item, ex, Target(102.5, hi, long_note), last)
+        ramp = "Разминочные подходы: 8 × 51.25 кг, потом 4 × 71.75 кг."
+        extra = "У тебя одна гантель: делай каждой рукой по очереди."
+        if ex.kind == "cardio":
+            extra = ("Бег-ходьба: 6 × (бег 1 мин + шаг 2 мин), всего ≈ 18 мин. Перед этим 5 минут ходьбы, после 3–5 минут "
+                     "шагом. Темп разговорный: пульс ≈ 123–144 уд/мин. Можешь говорить фразами, иначе замедлись.")
+        text = exercise_text(w, item, ex, Target(102.5, hi, long_note), last, extra, ramp if ex.kind == "weight" else None)
         assert len(text) <= CAPTION_LIMIT, (ex.id, len(text))

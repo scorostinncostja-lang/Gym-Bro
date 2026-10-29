@@ -77,3 +77,21 @@ def fmt_days(days: list[int]) -> str:
 
 def parse_days(s: str | None) -> list[int]:
     return [int(x) for x in s.split(",")] if s else []
+
+
+def pick_extra_days(strength: list[int], n: int) -> list[int]:
+    """Дни для кардио или гибкости: как можно дальше от силовых и друг от друга."""
+    free = [d for d in range(7) if d not in strength]
+    chosen: list[int] = []
+    for _ in range(min(n, len(free))):
+        taken = [*strength, *chosen]
+        best = max(free, key=lambda d: (min(min((d - x) % 7, (x - d) % 7) for x in taken) if taken else 3, -d))
+        chosen.append(best)
+        free.remove(best)
+    return sorted(chosen)
+
+
+def shift_time(hhmm: str, minutes: int) -> str:
+    h, m = map(int, hhmm.split(":"))
+    total = (h * 60 + m + minutes) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"

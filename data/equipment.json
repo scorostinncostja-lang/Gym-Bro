@@ -1,0 +1,17 @@
+[
+  {"id": "dumbbell", "name": "Гантели", "tag": "dumbbell", "kw": "гантел", "weights": true},
+  {"id": "kettlebell", "name": "Гиря", "tag": "kettlebell", "kw": "\\bгир[яюеи]\\b|\\bгирь\\b|kettlebell", "weights": true},
+  {"id": "barbell", "name": "Штанга", "tag": "barbell", "kw": "штанг", "weights": true},
+  {"id": "pullup_bar", "name": "Турник", "tag": "pullup_bar", "kw": "турник|перекладин"},
+  {"id": "dip_bars", "name": "Брусья", "tag": "bars", "kw": "брусь"},
+  {"id": "band", "name": "Резинки (ленты, петли)", "tag": "band", "kw": "резин|петл[яию]|жгут|\\bленты?\\b|\\bband", "resist": true},
+  {"id": "expander", "name": "Эспандер", "tag": "band", "kw": "эспандер", "resist": true},
+  {"id": "bench", "name": "Скамья", "tag": "bench", "kw": "скамь|лавк"},
+  {"id": "rope", "name": "Скакалка", "tag": "rope", "kw": "скакалк"},
+  {"id": "mat", "name": "Коврик", "tag": "mat", "kw": "коврик"},
+  {"id": "fitball", "name": "Фитбол", "tag": "fitball", "kw": "фитбол|гимнастическ\\w+ мяч"},
+  {"id": "bike_stationary", "name": "Велотренажёр", "tag": "bike_stationary", "kw": "велотренаж|велоэргометр"},
+  {"id": "bike", "name": "Велосипед", "tag": "bike", "kw": "велосипед|\\bвелик|велодорожк"},
+  {"id": "treadmill", "name": "Беговая дорожка", "tag": "treadmill", "kw": "беговая дорожк|беговой дорожк|\\bдорожк[аиу]\\b|беговуш"},
+  {"id": "elliptical", "name": "Эллипс", "tag": "elliptical", "kw": "эллипс|орбитрек"}
+]

@@ -97,3 +97,27 @@ SUPP_COMMENT_PROMPT = """\
 и добавлять новые нельзя. Напиши 3–5 предложений для этого человека: что в его наборе главное, что \
 можно не покупать, на что обратить внимание с учётом цели и возраста. Если в плане есть «не нужно» \
 или «не принимай», коротко объясни почему. Без вступлений."""
+
+GEAR_EXTRACT_PROMPT = """\
+Пользователь перечислил спортивный инвентарь, который у него есть дома. Разбери в JSON. Допустимые id: \
+dumbbell (гантели), kettlebell (гиря), barbell (штанга), pullup_bar (турник), dip_bars (брусья), band \
+(резинка, лента, петля), expander (эспандер), bench (скамья), rope (скакалка), mat (коврик), fitball \
+(фитбол), bike_stationary (велотренажёр), bike (велосипед), treadmill (беговая дорожка), elliptical \
+(эллипс). Для каждого предмета: count (сколько штук или null), weights (список весов или \
+сопротивлений в кг или null), adjustable (true, если разборные), min и max (для разборных, кг). Всё, \
+что не подошло ни под один id, положи как текст в other. Ничего не придумывай, веса бери только из \
+текста. Ответь ТОЛЬКО JSON: {"items": [{"id": "dumbbell", "count": 1, "weights": [5]}], "other": []}."""
+
+LABEL_PROMPT = """\
+Ты читаешь этикетку спортивной добавки по фото или тексту. Ничего не придумывай: если значения не видно, \
+ставь null. Ответь ТОЛЬКО JSON без пояснений:
+{"readable": true|false, "kind": "creatine|whey|omega3|vitd|multivit|caffeine|bcaa|glutamine|betaalanine|\
+citrulline|zma|collagen|hmb|gainer|electrolytes|preworkout|fatburner|testobooster|other", "brand": "название бренда или null", \
+"product": "название продукта или null", "serving_g": число или null (вес одной порции в граммах, у капсул масса порции), \
+"servings": число порций в упаковке или null, "net_g": масса нетто в граммах или null, "per_serving": {"protein_g": null, \
+"creatine_g": null, "epa_dha_mg": null (сумма EPA и DHA в мг), "vitd_iu": null (в МЕ, 1 мкг = 40 МЕ), "caffeine_mg": null, \
+"sugar_g": null, "carbs_g": null}, "proprietary_blend": true|false (фирменная смесь без дозировок отдельных компонентов), \
+"stimulants": ["кофеин, синефрин, йохимбин и т.п., если есть в составе"], "certs": ["знаки независимой проверки на упаковке: \
+Informed Sport, NSF, Creapure, IFOS и т.п."], "expiry_visible": true|false, "importer_visible": true|false (данные \
+импортёра или производителя), "datamatrix_visible": true|false (код маркировки), "claims": ["завышенные обещания, \
+например «+10 кг мышц»"], "notes": "что не удалось прочитать"}."""

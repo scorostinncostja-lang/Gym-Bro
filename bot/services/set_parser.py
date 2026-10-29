@@ -23,6 +23,8 @@ _WEIGHT_RE = re.compile(rf"({_NUM})\s*(?:кг|kg)\b")
 _REPS_RE = re.compile(r"(\d+)\s*(?:раз|повтор\w*|повт\b|р\b)")
 _SEC_RE = re.compile(r"(\d+)\s*(?:сек\w*|с\b|s\b)")
 _ANY_NUM = re.compile(_NUM)
+_MIN_RE = re.compile(r"(\d+)\s*(?:мин\w*|м\b|minutes?)")
+_KM_RE = re.compile(rf"({_NUM})\s*(?:км|km|километр\w*)")
 
 
 @dataclass(frozen=True)
@@ -51,7 +53,22 @@ def _num(s: str) -> float:
 def parse_set(text: str, kind: str, default_weight: float | None = None) -> ParsedSet | None:
     feel = detect_feel(text)
     t = text.lower()
-    max_reps = 600 if kind == "time" else 100
+    max_reps = 600 if kind == "time" else 300 if kind == "cardio" else 100
+
+    if kind == "cardio":
+        # «25 мин 4 км»: минуты в reps, километры в weight (0, если не названы).
+        km = _KM_RE.search(t)
+        distance = _num(km.group(1)) if km else 0.0
+        if km:
+            t = t[: km.start()] + " " + t[km.end():]
+        m = _MIN_RE.search(t)
+        minutes = int(m.group(1)) if m else None
+        if minutes is None:
+            nums = _ANY_NUM.findall(t)
+            minutes = int(_num(nums[0])) if nums else None
+        if minutes is None or not (1 <= minutes <= max_reps):
+            return None
+        return ParsedSet(distance, minutes, feel)
 
     weight: float | None = None
     reps: int | None = None

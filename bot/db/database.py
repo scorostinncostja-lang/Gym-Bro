@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS users (
     level TEXT,
     place TEXT,                -- основное место (по нему строится программа)
     places TEXT,               -- все доступные места: "gym,home_db,home_bw"
+    equipment TEXT,            -- JSON: инвентарь дома (bot/services/equipment.py)
+    goal2 TEXT,                -- вторая цель
+    city TEXT,
+    country TEXT,              -- RU, KZ, ...
+    cardio_days TEXT,          -- дополнительные дни кардио или гибкости: "1,5"
     days_per_week INTEGER,
     days TEXT,                 -- weekday numbers, Mon=0: "0,2,4"
     train_time TEXT,           -- "18:00"
@@ -79,6 +84,16 @@ CREATE TABLE IF NOT EXISTS stack (
     supp_id TEXT NOT NULL,
     PRIMARY KEY (tg_id, supp_id)
 );
+CREATE TABLE IF NOT EXISTS supp_products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id INTEGER NOT NULL,
+    supp_id TEXT NOT NULL,
+    brand TEXT,
+    data TEXT NOT NULL,        -- JSON разбора этикетки
+    price REAL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_supp_products ON supp_products(tg_id, supp_id);
 CREATE TABLE IF NOT EXISTS progress_media (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tg_id INTEGER NOT NULL,
@@ -98,15 +113,16 @@ CREATE INDEX IF NOT EXISTS ix_chat ON chat(tg_id, id);
 """
 
 USER_FIELDS = {
-    "name", "age", "height_cm", "weight_kg", "goal", "level", "place", "places", "days_per_week",
+    "name", "age", "height_cm", "weight_kg", "goal", "goal2", "level", "place", "places", "equipment", "city",
+    "country", "cardio_days", "days_per_week",
     "days", "train_time", "tz", "rotation_idx", "supp_time", "supp_remind", "onboarded",
 }
 WORKOUT_FIELDS = {
     "ex_i", "set_i", "pend_set_id", "cur_weight", "cur_reps", "status", "nagged",
-    "started_at", "finished_at", "plan", "place",
+    "started_at", "finished_at", "plan", "place", "warm",
 }
 
-_TABLES_BY_USER = ("measurements", "workouts", "sets", "usage", "stack", "chat", "progress_media", "users")
+_TABLES_BY_USER = ("measurements", "workouts", "sets", "usage", "stack", "chat", "progress_media", "supp_products", "users")
 
 
 def _now() -> str:
@@ -129,10 +145,17 @@ class Database:
 
     async def _migrate(self) -> None:
         """Старые базы: добавляем колонки, которых ещё не было."""
-        async with self.db.execute("PRAGMA table_info(users)") as cur:
-            cols = {r["name"] for r in await cur.fetchall()}
-        if "places" not in cols:
-            await self.db.execute("ALTER TABLE users ADD COLUMN places TEXT")
+        wanted = {
+            "users": {"places": "TEXT", "equipment": "TEXT", "goal2": "TEXT", "city": "TEXT",
+                      "country": "TEXT", "cardio_days": "TEXT"},
+            "workouts": {"warm": "INTEGER NOT NULL DEFAULT 1"},
+        }
+        for table, cols in wanted.items():
+            async with self.db.execute(f"PRAGMA table_info({table})") as cur:
+                have = {r["name"] for r in await cur.fetchall()}
+            for col, decl in cols.items():
+                if col not in have:
+                    await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
         await self.db.execute("UPDATE users SET places=place WHERE places IS NULL AND place IS NOT NULL")
 
     async def close(self) -> None:
@@ -188,6 +211,28 @@ class Database:
         for table in _TABLES_BY_USER:
             await self.db.execute(f"DELETE FROM {table} WHERE tg_id=?", (tg_id,))
         await self.db.commit()
+
+    # ---------- добавки, которые человек купил ----------
+    async def add_product(self, tg_id: int, supp_id: str, brand: str | None, data: dict, price: float | None = None) -> int:
+        return await self._exec(
+            "INSERT INTO supp_products(tg_id, supp_id, brand, data, price, created_at) VALUES(?,?,?,?,?,?)",
+            (tg_id, supp_id, brand, json.dumps(data, ensure_ascii=False), price, _now()),
+        )
+
+    async def products(self, tg_id: int) -> list[dict]:
+        rows = await self._all("SELECT * FROM supp_products WHERE tg_id=? ORDER BY id", (tg_id,))
+        for r in rows:
+            r["data"] = json.loads(r["data"])
+        return rows
+
+    async def set_product_price(self, product_id: int, tg_id: int, price: float) -> None:
+        await self._exec("UPDATE supp_products SET price=? WHERE id=? AND tg_id=?", (price, product_id, tg_id))
+
+    async def count_workouts_with(self, tg_id: int, ex_id: str) -> int:
+        row = await self._one(
+            "SELECT COUNT(DISTINCT workout_id) AS c FROM sets WHERE tg_id=? AND ex_id=?", (tg_id, ex_id)
+        )
+        return row["c"] if row else 0
 
     # ---------- прогресс-фото ----------
     async def add_progress_media(self, tg_id: int, day: str, items: list[tuple[str, str, str]]) -> None:

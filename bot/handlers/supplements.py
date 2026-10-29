@@ -1,17 +1,24 @@
 """Добавки: отметил, что у тебя есть, и бот считает план по весу. Справочник «работает / мусор» рядом."""
 import html
+import io
 import logging
+import re
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from bot.config import Settings
 from bot.data import supplements
 from bot.db.database import Database
-from bot.prompts import SUPP_COMMENT_PROMPT, system_prompt
+from bot.prompts import LABEL_PROMPT, SUPP_COMMENT_PROMPT, system_prompt
 from bot.services.guard import MINOR_AGE
-from bot.services.llm import LLM, LLMError
+from bot.services.llm import LLM, LLMError, Media
+from bot.services.location import country_of, parse_location
+from bot.services.supp_label import evaluate, parse_label_json, render
+from bot.services.supp_shop import TIERS, buyable_for, recommend
 from bot.services.profile import build_profile
 from bot.services.reminders import Reminders
 from bot.services.supp_advice import TEEN_FOOTER
@@ -35,9 +42,11 @@ VERDICT_ICON = {k: v.split()[0] for k, v in VERDICTS.items()}
 
 MAIN_TEXT = (
     "<b>Добавки без рекламы</b>\n"
-    "Отметь, что у тебя уже есть или что хочешь купить. Я посчитаю по твоему весу: сколько принимать, "
-    "когда, а что не нужно вообще.\n"
-    "Можно и текстом: «у меня есть креатин и протеин».\n\n"
+    "• <b>Уже купил:</b> пришли фото банки (лицо, состав, срок годности). Проверю состав и порции, "
+    "честно скажу, если что-то не так, и посчитаю дозу под твой вес.\n"
+    "• <b>Только планируешь:</b> подскажу, что искать, какие бренды-ориентиры и где заказать у тебя в стране: "
+    "бюджетно, подходящее или лучшее.\n"
+    "• <b>План приёма:</b> сколько, когда и во сколько, по твоему весу и цели.\n\n"
     "Порядок важности: еда → сон → прогрессия нагрузки → и только потом добавки."
 )
 LEGEND = (
@@ -56,9 +65,16 @@ def _is_adult(user: dict | None) -> bool:
     return bool(user and (user.get("age") or 0) >= MINOR_AGE)
 
 
+class SuppFlow(StatesGroup):
+    photos = State()
+    price = State()
+    loc = State()
+
+
 def main_keyboard():
     return inline([
-        [("✅ Отметить, что у меня есть", Sup(act="own"))],
+        [("📸 Уже купил: проверить по фото", Sup(act="have"))],
+        [("🛒 Планирую купить: что и где", Sup(act="buy"))],
         [("🧮 Мой план приёма", Sup(act="plan"))],
         [("📚 Справочник: что работает", Sup(act="list"))],
     ])
@@ -273,4 +289,221 @@ async def cmd_supp_time(message: Message, command: CommandObject, db: Database, 
     await db.update_user(message.from_user.id, supp_time=t)
     reminders.schedule_user((await db.get_user(message.from_user.id)))  # type: ignore[arg-type]
     await message.answer(f"Время напоминания: {t}.")
+
+
+
+# ---------- уже купил: проверка по фото ----------
+MAX_LABEL_PHOTOS = 4
+
+
+def _cancel_kb(extra: list | None = None):
+    rows = [extra] if extra else []
+    rows.append([("Отмена", Sup(act="cancel"))])
+    return inline(rows)
+
+
+@router.callback_query(Sup.filter(F.act == "cancel"))
+async def on_cancel(cb: CallbackQuery, state: FSMContext):
+    await cb.answer("Отменено")
+    await state.clear()
+    await cb.message.edit_reply_markup(reply_markup=None)
+
+
+@router.callback_query(Sup.filter(F.act == "have"))
+async def on_have(cb: CallbackQuery, state: FSMContext, db: Database):
+    user = await db.get_user(cb.from_user.id)
+    if not user or not user["onboarded"]:
+        await cb.answer("Сначала анкета: /start", show_alert=True)
+        return
+    await cb.answer()
+    await state.set_state(SuppFlow.photos)
+    await state.set_data({"media": []})
+    await cb.message.answer(
+        "📸 <b>Пришли 1–4 фото добавки</b> (это банка, а не ты):\n"
+        "1. Лицевая сторона с названием и брендом.\n"
+        "2. Состав: «Supplement Facts» или «Пищевая ценность», чтобы были видны порция и числа.\n"
+        "3. Срок годности, серия, данные импортёра и код маркировки.\n"
+        "Свет ровный, без бликов. Фото могут идти по одному или альбомом. Нет возможности сфотографировать? "
+        "Просто напиши состав текстом.",
+        reply_markup=_cancel_kb(),
+    )
+
+
+@router.message(SuppFlow.photos, F.photo)
+async def on_label_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    media = list(data.get("media", []))
+    if len(media) >= MAX_LABEL_PHOTOS:
+        return
+    media.append(message.photo[-1].file_id)
+    await state.update_data(media=media)
+    await message.answer(
+        f"Принял {len(media)} из {MAX_LABEL_PHOTOS}. Пришли ещё (состав, срок годности) или жми «Разобрать».",
+        reply_markup=_cancel_kb([("🔍 Разобрать", Sup(act="analyze"))]),
+    )
+
+
+@router.callback_query(Sup.filter(F.act == "analyze"), SuppFlow.photos)
+async def on_analyze(cb: CallbackQuery, state: FSMContext, db: Database, llm: LLM, settings: Settings):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    data = await state.get_data()
+    if not data.get("media"):
+        await cb.message.answer("Фото пока нет. Пришли снимок банки или напиши состав текстом.")
+        return
+    await _analyze(cb.message, cb.from_user.id, data["media"], None, state, db, llm, settings)
+
+
+@router.message(SuppFlow.photos, F.text, ~F.text.startswith("/"))
+async def on_label_text(message: Message, state: FSMContext, db: Database, llm: LLM, settings: Settings):
+    data = await state.get_data()
+    await _analyze(message, message.from_user.id, data.get("media", []), message.text, state, db, llm, settings)
+
+
+async def _analyze(
+    message: Message, uid: int, file_ids: list[str], text: str | None, state: FSMContext,
+    db: Database, llm: LLM, settings: Settings,
+) -> None:
+    user = await db.get_user(uid)
+    assert user
+    if not llm.available:
+        await message.answer("Чтобы читать этикетки, нужен ключ ИИ (GEMINI_API_KEY или GROQ_API_KEY).")
+        return
+    if not await db.take_quota(uid, "vision", settings.limit_vision_per_day):
+        await message.answer("Лимит разборов фото на сегодня исчерпан. Завтра снова или напиши состав текстом.")
+        return
+    await message.bot.send_chat_action(message.chat.id, "typing")
+    media = []
+    for fid in file_ids:
+        buf = io.BytesIO()
+        await message.bot.download(fid, destination=buf)
+        media.append(Media(buf.getvalue(), "image/jpeg"))
+    prompt = "Разбери этикетку по фото." if media else f"Этикетка текстом:\n{text}"
+    if media and text:
+        prompt += f"\nПользователь дописал: {text}"
+    try:
+        raw = await llm.chat(LABEL_PROMPT, [], prompt, media=media or None, max_tokens=700, temperature=0)
+    except LLMError as e:
+        log.warning("Этикетка без ИИ: %s", e)
+        await message.answer("Не получилось прочитать этикетку: ИИ сейчас недоступен. Попробуй через минуту.")
+        return
+    label = parse_label_json(raw)
+    if not label:
+        await message.answer("Не смог разобрать ответ. Пришли более чёткое фото состава или напиши его текстом.")
+        return
+    verdict = evaluate(label, user)
+    pid = await db.add_product(uid, verdict.supp_id, label.get("brand"), label)
+    if verdict.supp_id in supplements():
+        await db.stack_add(uid, verdict.supp_id)
+    await state.clear()
+    rows = [[("💰 Указать цену", Sup(act="price", id=str(pid)))]]
+    if verdict.supp_id in supplements():
+        rows.append([("🧮 Мой план приёма", Sup(act="plan"))])
+    rows.append([("➕ Проверить ещё одну", Sup(act="have"))])
+    await message.answer(render(verdict), reply_markup=inline(rows))
+
+
+@router.callback_query(Sup.filter(F.act == "price"))
+async def on_price(cb: CallbackQuery, callback_data: Sup, state: FSMContext):
+    await cb.answer()
+    await state.set_state(SuppFlow.price)
+    await state.set_data({"pid": int(callback_data.id)})
+    await cb.message.answer("Напиши цену упаковки числом (в своей валюте), например <code>12500</code>. "
+                            "Посчитаю цену за день и за 100 г белка.", reply_markup=_cancel_kb())
+
+
+@router.message(SuppFlow.price, F.text, ~F.text.startswith("/"))
+async def on_price_value(message: Message, state: FSMContext, db: Database):
+    m = re.search(r"\d[\d\s.,]*", message.text.replace("\xa0", " "))
+    price = float(re.sub(r"[\s,]", "", m.group(0)).replace(",", ".")) if m else None
+    if not price or price <= 0:
+        await message.answer("Не понял цену. Напиши число, например 12500.")
+        return
+    data = await state.get_data()
+    user = await db.get_user(message.from_user.id)
+    prod = next((p for p in await db.products(message.from_user.id) if p["id"] == data["pid"]), None)
+    await state.clear()
+    if not user or not prod:
+        await message.answer("Не нашёл эту добавку. Пришли фото заново.")
+        return
+    await db.set_product_price(prod["id"], message.from_user.id, price)
+    await message.answer(render(evaluate(prod["data"], user), price))
+
+
+# ---------- планирую купить: что и где ----------
+@router.callback_query(Sup.filter(F.act == "buy"))
+async def on_buy(cb: CallbackQuery, db: Database):
+    user = await db.get_user(cb.from_user.id)
+    if not user or not user["onboarded"]:
+        await cb.answer("Сначала анкета: /start", show_alert=True)
+        return
+    await cb.answer()
+    rows = [[(supplements()[sid]["name"].split(" (")[0], Sup(act="b1", id=sid))] for sid in buyable_for(user)]
+    rows.append([("◀ Назад", Sup(act="main"))])
+    await cb.message.edit_text(
+        "<b>Что хочешь купить?</b> Показываю только то, что имеет смысл для тебя. Остальное из справочника "
+        "(кофеин, предтренировочные, жиросжигатели) не советую.",
+        reply_markup=inline(rows),
+    )
+
+
+@router.callback_query(Sup.filter(F.act == "b1"))
+async def on_buy_tier(cb: CallbackQuery, callback_data: Sup):
+    await cb.answer()
+    sid = callback_data.id
+    rows = [[(label, Sup(act="b2", id=f"{sid}|{tier}"))] for tier, label in TIERS.items()]
+    rows.append([("Все три варианта", Sup(act="b2", id=f"{sid}|all"))])
+    rows.append([("◀ Назад", Sup(act="buy"))])
+    await cb.message.edit_text(
+        f"<b>{html.escape(supplements()[sid]['name'])}</b>\nЧто важнее: цена, баланс или качество?",
+        reply_markup=inline(rows),
+    )
+
+
+async def _send_recommendation(message: Message, user: dict, sid: str, tier: str) -> None:
+    text = recommend(user, sid, None if tier == "all" else tier)
+    for i in range(0, len(text), 3800):
+        await message.answer(text[i:i + 3800])
+
+
+@router.callback_query(Sup.filter(F.act == "b2"))
+async def on_buy_result(cb: CallbackQuery, callback_data: Sup, state: FSMContext, db: Database):
+    await cb.answer()
+    sid, tier = callback_data.id.split("|")
+    user = await db.get_user(cb.from_user.id)
+    assert user
+    if country_of(user) == "DEFAULT" and not user.get("country"):
+        await state.set_state(SuppFlow.loc)
+        await state.set_data({"sid": sid, "tier": tier})
+        await cb.message.answer(
+            "Напиши, где ты живёшь: город или страну (например «Алматы» или «Казахстан»), и часовой пояс, "
+            "если города нет в списке (<i>+5</i>). Магазины и проверки подлинности зависят от страны.",
+            reply_markup=_cancel_kb(),
+        )
+        return
+    await _send_recommendation(cb.message, user, sid, tier)
+
+
+@router.message(SuppFlow.loc, F.text, ~F.text.startswith("/"))
+async def on_buy_location(message: Message, state: FSMContext, db: Database, reminders: Reminders):
+    loc = parse_location(message.text)
+    if not loc:
+        await message.answer("Не нашёл. Напиши город или страну: «Алматы», «Россия», либо пояс «+3».")
+        return
+    data = await state.get_data()
+    fields = {"country": loc.country, "city": loc.city}
+    if loc.tz_known:  # назвали только страну: свой часовой пояс человека не трогаем
+        fields["tz"] = loc.tz
+    await db.update_user(message.from_user.id, **fields)
+    user = await db.get_user(message.from_user.id)
+    assert user
+    reminders.schedule_user(user)
+    await state.clear()
+    await _send_recommendation(message, user, data["sid"], data["tier"])
+
+
+@router.callback_query(Sup.filter(F.act == "took"))
+async def on_took(cb: CallbackQuery):
+    await cb.answer("Отлично 💪")
+    await cb.message.edit_reply_markup(reply_markup=None)
 

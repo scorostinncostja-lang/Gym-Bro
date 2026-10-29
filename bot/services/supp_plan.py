@@ -10,11 +10,7 @@ from bot.data import supplements
 from bot.services.supp_advice import teen_ok
 
 ADULT_AGE = 18
-# г белка на кг веса за весь день
-_PROTEIN_ADULT = {"muscle": 1.8, "strength": 1.8, "fit": 1.4, "lose": 1.8}
-_PROTEIN_TEEN = {"muscle": 1.6, "strength": 1.6, "fit": 1.4, "lose": 1.4}
-
-GOAL_RU = {"muscle": "набор мышц", "strength": "сила", "fit": "форма и здоровье", "lose": "похудение"}
+from bot.services.goals import goal_name, protein_per_kg
 
 STATUS_TITLE = {
     "take": "✅ <b>Принимай</b>",
@@ -58,8 +54,7 @@ def _first_sentence(text: str) -> str:
 
 
 def _protein_range(weight: float, goal: str, adult: bool) -> tuple[int, int]:
-    table = _PROTEIN_ADULT if adult else _PROTEIN_TEEN
-    gpk = table.get(goal, 1.4)
+    gpk = protein_per_kg(goal) if adult else min(protein_per_kg(goal), 1.6)  # подросткам без верхних значений
     return round(weight * (gpk - 0.2) / 5) * 5, round(weight * (gpk + 0.2) / 5) * 5
 
 
@@ -82,10 +77,12 @@ def _line(s: dict, adult: bool, weight: float, goal: str) -> PlanLine:
             dose = f"{grams:g} г в день"
         else:
             dose = "3 г в день (мерная ложка из банки)"
+        weak = goal in ("endurance", "flex")
         return PlanLine(
-            sid, name, "take", dose + ", без «загрузки»",
+            sid, name, "maybe" if weak else "take", dose + ", без «загрузки»",
             "каждый день, и в дни отдыха тоже; с любой едой, можно после тренировки",
-            "Эффект копится 3–4 недели. Пей воду в течение дня. Нельзя при болезнях почек.",
+            ("Для твоей цели даёт мало: креатин помогает силе и объёму, а не выносливости. " if weak else "")
+            + "Эффект копится 3–4 недели. Пей воду в течение дня. Нельзя при болезнях почек.",
         )
     if sid == "whey":
         low, high = _protein_range(weight, goal, adult)
@@ -149,7 +146,7 @@ def _timeline(plan: Plan) -> list[str]:
 def render_plan(plan: Plan) -> str:
     head = (
         f"🧮 <b>План приёма добавок</b>\n"
-        f"Рассчитано на {plan.weight:g} кг, {plan.age} лет, цель: {GOAL_RU.get(plan.goal, plan.goal)}."
+        f"Рассчитано на {plan.weight:g} кг, {plan.age} лет, цель: {goal_name(plan.goal)}."
     )
     if not plan.lines:
         return head + "\n\nНабор пуст. Отметь, что у тебя есть: /supplements"
@@ -182,16 +179,23 @@ def render_plan(plan: Plan) -> str:
 
 def plan_facts(plan: Plan) -> str:
     """Для ИИ: готовый план в виде текста, числа менять нельзя."""
-    rows = [f"Вес {plan.weight:g} кг, возраст {plan.age}, цель {GOAL_RU.get(plan.goal, plan.goal)}."]
+    rows = [f"Вес {plan.weight:g} кг, возраст {plan.age}, цель {goal_name(plan.goal)}."]
     for ln in plan.lines:
         rows.append(f"- {ln.name} [{ln.status}] {ln.dose} {ln.when} {ln.note}".strip())
     return "\n".join(rows)
 
 
-def daily_reminder_lines(plan: Plan) -> list[str]:
-    """Что напомнить в ежедневное время: всё, что не привязано к тренировке."""
+def slot_lines(plan: Plan, slot: str, trains_today: bool) -> list[str]:
+    """Что принять в этот момент: утро с едой, перед тренировкой, после неё."""
     out = []
     for ln in plan.lines:
-        if ln.status in ("take", "maybe") and ln.sid not in ("whey", "caffeine"):
-            out.append(f"{ln.name}: {ln.dose}")
+        if ln.status not in ("take", "maybe"):
+            continue
+        short = f"{ln.name}: {ln.dose}"
+        if slot == "am" and (ln.sid in ("multivit", "vitd", "omega3") or (ln.sid == "creatine" and not trains_today)):
+            out.append(short)
+        elif slot == "pre" and ln.sid == "caffeine":
+            out.append(short)
+        elif slot == "post" and ln.sid in ("whey", "creatine"):
+            out.append(short)
     return out

@@ -1,4 +1,5 @@
 """Сквозной прогон: настоящий диспетчер и обработчики, Telegram подменён."""
+import json
 from datetime import datetime
 
 import pytest
@@ -15,7 +16,7 @@ from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
 from bot.services.reminders import Reminders
 from bot.services.workout import WorkoutService
-from bot.ui import Fl, Ob, Rem
+from bot.ui import Fl, Ob, Rem, Wk
 
 CHAT = Chat(id=1, type="private")
 USER = User(id=1, is_bot=False, first_name="Тест")
@@ -110,17 +111,24 @@ async def onboard(c: Chatter, age="15", method="tape"):
     await finish_onboarding(c)
 
 
-async def finish_onboarding(c: Chatter, places=("gym",), time_text="18:00"):
-    await c.press(Ob(act="goal", arg="muscle"))
+async def finish_onboarding(c: Chatter, places=("gym",), time_text="18:00", city="Алматы", extra="0", goal="muscle",
+                            skip_country=False):
+    await c.press(Ob(act="goal", arg=goal))
+    await c.press(Ob(act="goal2", arg="-"))
     await c.press(Ob(act="level", arg="new"))
     for p in places:
         await c.press(Ob(act="pl", arg=p))
     await c.press(Ob(act="pldone"))
+    if "home_db" in places:
+        await c.press(Ob(act="gdone"))
     await c.press(Ob(act="n", arg="3"))
     await c.press(Ob(act="dpreset"))
     await c.press(Ob(act="ddone"))
     await c.say(time_text)
-    await c.press(Ob(act="tz", arg="4"))
+    await c.press(Ob(act="x", arg=extra))
+    await c.say(city)
+    if skip_country:
+        await c.press(Ob(act="cskip"))
 
 
 async def test_onboarding_creates_profile_and_schedule(rig):
@@ -130,6 +138,7 @@ async def test_onboarding_creates_profile_and_schedule(rig):
     u = await db.get_user(1)
     assert u["onboarded"] == 1 and u["age"] == 15 and u["days"] == "0,2,4"
     assert u["train_time"] == "18:00" and u["tz"] == "Asia/Almaty" and u["place"] == "gym"
+    assert u["country"] == "KZ" and u["city"] == "Алматы" and u["goal"] == "muscle"
     series = await db.measurement_series(1)
     assert series["weight"][0][1] == 62 and series["biceps"][0][1] == 28 and len(series) == 7
     assert any("Готово" in t for t in session.texts())
@@ -268,11 +277,9 @@ async def test_double_tap_on_start_does_not_duplicate_card(rig):
     await onboard(c)
     await c.say("/today")
     w = await db.next_planned_workout(1)
-    before = len([n for n, _ in session.sent if n in ("SendAnimation", "SendMessage", "SendMediaGroup")])
     await asyncio.gather(c.press(Rem(act="go", wid=w["id"])), c.press(Rem(act="go", wid=w["id"])))
-    cards = [n for n, d in session.sent if n in ("SendAnimation", "SendMessage") and "1/" in (d.get("text") or d.get("caption") or "")]
-    assert len(cards) == 1, "двойной тап не должен слать вторую карточку упражнения"
-    assert before >= 1
+    warm = [t for t in session.texts() if "Разминка" in t]
+    assert len(warm) == 1, "двойной тап не должен слать вторую разминку"
 
 
 async def test_pain_message_stops_instead_of_logging(rig):
@@ -294,6 +301,7 @@ async def test_one_message_per_set_and_text_feel(rig):
     await c.say("/today")
     w = await db.next_planned_workout(1)
     await c.press(Rem(act="go", wid=w["id"]))
+    await c.press(Wk(act="warm", wid=w["id"]))
     n0 = len([1 for n, _ in session.sent if n == "SendMessage"])
     await c.say("40 10")          # 1 сообщение: «Как далось?»
     await c.say("нормально")      # 1 сообщение: итог + подсказка + следующий подход вместе
@@ -368,3 +376,219 @@ async def test_closed_bot_blocks_strangers(rig):
     await c.say("/start")
     assert any("закрытый" in t for t in session.texts())
     assert await db.get_user(1) is None
+
+
+class StubLLM:
+    """ИИ-заглушка: возвращает заранее заданный ответ, наружу не ходит."""
+    available = True
+    gemini = object()
+    groq = None
+
+    def __init__(self, reply: str = "ок"):
+        self.reply = reply
+        self.calls: list[str] = []
+
+    async def chat(self, system, history, user_text, media=None, max_tokens=700, temperature=0.6):
+        self.calls.append(user_text)
+        return self.reply
+
+    async def classify_feel(self, text):
+        return None, False
+
+    async def extract_gear(self, text):
+        return None
+
+    async def extract_set(self, text):
+        return None, None
+
+
+async def start_to_places(c: Chatter, goal_text: str | None = None):
+    await c.say("/start")
+    for v in ("15", "62", "175"):
+        await c.say(v)
+    await c.press(Ob(act="mnone"))
+    if goal_text:
+        await c.press(Ob(act="goal_text"))
+        await c.say(goal_text)
+    else:
+        await c.press(Ob(act="goal", arg="muscle"))
+        await c.press(Ob(act="goal2", arg="-"))
+    await c.press(Ob(act="level", arg="new"))
+
+
+async def test_home_gear_written_in_own_words_shapes_the_program(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await start_to_places(c)
+    await c.press(Ob(act="pl", arg="home_db"))
+    await c.press(Ob(act="pldone"))
+    await c.say("одна гантель 5 кг, турник, резинка 25 кг, эспандер 25 кг")
+    assert any("Записал" in t and "Турник" in t for t in session.texts())
+    await c.press(Ob(act="gdone"))
+    await c.press(Ob(act="n", arg="3"))
+    await c.press(Ob(act="dpreset"))
+    await c.press(Ob(act="ddone"))
+    await c.say("18:00")
+    await c.press(Ob(act="x", arg="0"))
+    await c.say("Москва")
+    u = await db.get_user(1)
+    from bot.services.equipment import load_gear
+    gear = {i["id"]: i for i in load_gear(u)["items"]}
+    assert gear["dumbbell"]["weights"] == [5.0] and gear["band"]["weights"] == [25.0] and "pullup_bar" in gear
+    await c.say("/plan")
+    plan_text = "\n".join(session.texts())
+    assert "Жим ногами" not in plan_text and "тренажёре" not in plan_text.split("Ближайшая тренировка")[-1]
+
+
+async def test_goal_written_by_user_sets_goals(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await start_to_places(c, goal_text="хочу рельеф и выносливость")
+    await finish_places_and_schedule(c)
+    u = await db.get_user(1)
+    assert u["goal"] == "definition" and u["goal2"] == "endurance"
+
+
+async def finish_places_and_schedule(c: Chatter, extra="0", city="Алматы"):
+    await c.press(Ob(act="pl", arg="gym"))
+    await c.press(Ob(act="pldone"))
+    await c.press(Ob(act="n", arg="3"))
+    await c.press(Ob(act="dpreset"))
+    await c.press(Ob(act="ddone"))
+    await c.say("18:00")
+    await c.press(Ob(act="x", arg=extra))
+    await c.say(city)
+
+
+async def test_extra_cardio_days_get_workout_and_reminder(rig):
+    from datetime import date, timedelta
+
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await start_to_places(c, goal_text="выносливость")
+    await finish_places_and_schedule(c, extra="2")
+    u = await db.get_user(1)
+    extra_days = [int(x) for x in u["cardio_days"].split(",")]
+    assert len(extra_days) == 2 and not set(extra_days) & {0, 2, 4}
+    jobs = [j.id for j in (await _jobs(dp))]
+    assert "wk:1:cardio" in jobs
+    d = date.today()
+    while d.weekday() != extra_days[0]:
+        d += timedelta(days=1)
+    w = await dp.workflow_data["workouts"].ensure_planned(u, d)
+    assert w["day_name"] == "Кардио" and w["plan"][0]["kind"] == "cardio"
+
+
+async def test_warmup_comes_first_and_stretch_after_workout(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await c.say("/today")
+    w = await db.next_planned_workout(1)
+    await c.press(Rem(act="go", wid=w["id"]))
+    assert any("Разминка" in t for t in session.texts())
+    await c.press(Wk(act="warm", wid=w["id"]))
+    await c.say("40 10 нормально")
+    await c.say("/finish")
+    assert any("Растяжка" in t for t in session.texts())
+    assert any("Разбор тренера" in t for t in session.texts())
+
+
+async def test_settings_gear_flow_rebuilds_today(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import St
+    await c.press(St(act="place"))
+    await c.press(Ob(act="pl", arg="home_db"))
+    await c.press(Ob(act="pl", arg="gym"))   # зал снимаем
+    await c.press(Ob(act="pldone"))
+    await c.say("две гантели по 8 кг, скакалка")
+    await c.press(Ob(act="gdone"))
+    u = await db.get_user(1)
+    assert u["place"] == "home_db" and "скакалк" in " ".join(session.texts()).lower()
+    assert "8" in u["equipment"]
+
+
+async def test_supplement_label_flow_by_text_and_price(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    stub = StubLLM(json.dumps({
+        "readable": True, "kind": "creatine", "brand": "Optimum Nutrition", "product": "Micronized Creatine",
+        "serving_g": 5, "servings": 120, "net_g": 600, "per_serving": {"creatine_g": 5}, "certs": ["Informed Sport"],
+        "expiry_visible": True, "importer_visible": True, "proprietary_blend": False, "stimulants": [], "claims": []}))
+    dp.workflow_data["llm"] = stub
+    from bot.ui import Sup
+    await c.press(Sup(act="have"))
+    await c.say("Optimum Nutrition Micronized Creatine, порция 5 г, креатин 5 г, 120 порций")
+    text = "\n".join(session.texts())
+    assert "Нормально" in text and "Informed Sport" in text and "3 г" in text
+    products = await db.products(1)
+    assert len(products) == 1 and products[0]["supp_id"] == "creatine"
+    assert "creatine" in await db.stack_list(1)
+    await c.press(Sup(act="price", id=str(products[0]["id"])))
+    await c.say("12 000")
+    assert any("в день" in t for t in session.texts())
+    assert (await db.products(1))[0]["price"] == 12000
+
+
+async def test_label_photos_are_collected_before_analysis(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import Sup
+    await c.press(Sup(act="have"))
+    await c.photo(1)
+    await c.photo(2)
+    assert any("Принял 2 из 4" in t for t in session.texts())
+    await c.press(Sup(act="cancel"))
+    await c.photo(3)  # после отмены фото уходит в обычный разбор, а не в добавки
+    assert not any("Принял 3 из 4" in t for t in session.texts())
+
+
+async def test_buy_flow_asks_country_then_gives_marketplaces(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await c.say("/start")
+    for v in ("15", "62", "175"):
+        await c.say(v)
+    await c.press(Ob(act="mnone"))
+    await c.press(Ob(act="goal", arg="muscle"))
+    await c.press(Ob(act="goal2", arg="-"))
+    await c.press(Ob(act="level", arg="new"))
+    await finish_places_and_schedule(c, city="+5")
+    await c.press(Ob(act="cskip"))
+    assert (await db.get_user(1))["country"] is None
+    from bot.ui import Sup
+    await c.press(Sup(act="b1", id="creatine"))
+    await c.press(Sup(act="b2", id="creatine|fit"))
+    assert any("где ты живёшь" in t for t in session.texts())
+    await c.say("Казахстан")
+    text = "\n".join(session.texts())
+    assert "Kaspi.kz" in text and "Подходящее" in text
+    assert (await db.get_user(1))["country"] == "KZ"
+
+
+async def test_supplement_reminders_split_by_time_slot(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    for sid in ("creatine", "whey", "vitd"):
+        await db.stack_add(1, sid)
+    reminders = dp.workflow_data["reminders"]
+    await db.update_user(1, days="0,1,2,3,4,5,6", supp_remind=1)  # тренировка каждый день
+    await reminders.send_supp_reminder(1, "am")
+    await reminders.send_supp_reminder(1, "post")
+    texts = session.texts()
+    am = next(t for t in texts if "Добавки с едой" in t)
+    post = next(t for t in texts if "После тренировки" in t)
+    assert "Витамин D" in am and "Креатин" not in am
+    assert "Сывороточный протеин" in post and "Креатин" in post
+    await db.update_user(1, days="")
+    await reminders.send_supp_reminder(1, "am")
+    assert any("Креатин" in t for t in session.texts() if "Добавки с едой" in t)
+    jobs = [j.id for j in (await _jobs(dp))]
+    reminders.schedule_user(await db.get_user(1))
+    jobs = {j.id for j in reminders.scheduler.get_jobs()}
+    assert "sp:1:am" in jobs

@@ -12,9 +12,12 @@ from aiogram.types import CallbackQuery, Message
 from bot.cards import send_animation, send_exercise_media, steps_text
 from bot.data import find_exercises, get_exercise
 from bot.db.database import Database
-from bot.handlers.onboarding import GOALS, MEASURE_LABELS, MEASURE_UNITS
+from bot.handlers.onboarding import MEASURE_LABELS, MEASURE_UNITS
 from bot.data import program_templates
 from bot.services.exercise_db import ExerciseDB
+from bot.services.equipment import item_label, load_gear
+from bot.services.goals import goal_name
+from bot.services.location import COUNTRY_NAME
 from bot.services.places import places_label, user_places
 from bot.services.program_builder import build_day
 from bot.services.reminders import Reminders
@@ -33,10 +36,10 @@ HELP = """\
 📊 /stats — прогресс, серия, рабочие веса
 📏 /measure — замеры: лента, фото или кружок
 📸 /progress — фото «было → стало», /photo_guide — как снимать
-💊 /supplements — отметь, что у тебя есть, посчитаю дозы по твоему весу
+💊 /supplements — проверю добавку по фото, посчитаю дозы по весу, подскажу, что и где купить
 🔎 /exercise присед — анимация и техника (русский или английский)
 📚 /library — каталог упражнений по группам мышц
-⚙️ /settings — места, расписание, часовой пояс
+⚙️ /settings — цель, места, инвентарь, расписание, кардио, город
 🔒 /privacy — какие данные я храню
 🗑 /delete_me — удалить все данные
 
@@ -47,7 +50,7 @@ HELP = """\
 
 <b>Можно просто написать</b>
 • «напоминай в 19:30» или «тренируюсь по пн, ср, пт» — поменяю расписание
-• «у меня есть креатин и протеин» — посчитаю план приёма
+• «у меня есть креатин и протеин» — посчитаю план приёма по твоему весу
 • любой вопрос по технике, питанию и восстановлению; фото еды и видео техники тоже принимаю
 
 """ + ATTRIBUTION + "."
@@ -61,7 +64,7 @@ PRIVACY = """\
 <b>Куда уходят данные</b>
 • Текст вопросов, фото еды и видео техники отправляются в Google Gemini или Groq для ответа. \
 Голосовые — в Groq для расшифровки. Telegram-ник и ID туда не передаются.
-• Фото еды и видео техники не сохраняются, анализ идёт «на лету».
+• Фото еды, видео техники и фото банок добавок не сохраняются, анализ идёт «на лету».
 • Фото и кружки тела никуда не отправляются и ИИ не анализируются: они только для твоего сравнения.
 
 Удалить всё: /delete_me."""
@@ -88,7 +91,7 @@ async def cmd_plan(message: Message, db: Database):
     days = parse_days(user["days"])
     blocks = []
     for tpl in program_templates(user["days_per_week"]):
-        items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in build_day(tpl, user["place"]))
+        items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in build_day(tpl, user))
         blocks.append(f"<b>{html.escape(tpl['name'])}</b>\n{items}")
     nxt = next_training(days, user["train_time"], user["tz"])
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
@@ -275,16 +278,23 @@ async def cmd_settings(message: Message, db: Database):
     if not user or not user["onboarded"]:
         await message.answer("Сначала анкета: /start")
         return
+    goal = goal_name(user["goal"]) + (f" + {goal_name(user['goal2'])}" if user.get("goal2") else "")
+    gear = load_gear(user)
+    extra = parse_days(user.get("cardio_days"))
+    where = ", ".join(x for x in (user.get("city"), COUNTRY_NAME.get(user.get("country") or "")) if x) or "не указан"
     await message.answer(
         "⚙️ <b>Настройки</b>\n"
-        f"Цель: {GOALS.get(user['goal'], '—')}\n"
+        f"Цель: {goal}\n"
         f"Места: {places_label(user_places(user))}\n"
+        f"Инвентарь дома: {', '.join(item_label(i) for i in gear['items']) or 'не указан'}\n"
         f"Расписание: {fmt_days(parse_days(user['days']))} в {user['train_time']}\n"
-        f"Часовой пояс: {user['tz']}",
+        f"Кардио или гибкость: {fmt_days(extra) if extra else 'нет'}\n"
+        f"Город: {where} ({user['tz']})",
         reply_markup=inline([
-            [("📍 Место", St(act="place")), ("📆 Расписание", St(act="sched"))],
-            [("🌍 Часовой пояс", St(act="tz")), ("📏 Замеры", St(act="meas"))],
-            [("🗑 Удалить мои данные", St(act="del"))],
+            [("🎯 Цель", St(act="goal")), ("📍 Места", St(act="place"))],
+            [("🧰 Инвентарь", St(act="gear")), ("📆 Расписание", St(act="sched"))],
+            [("🏃 Кардио и гибкость", St(act="extra")), ("🌍 Город и пояс", St(act="tz"))],
+            [("📏 Замеры", St(act="meas")), ("🗑 Удалить мои данные", St(act="del"))],
         ]),
     )
 

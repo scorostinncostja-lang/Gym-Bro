@@ -8,16 +8,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
-from bot.data import PLACES
+from bot.data import PLACES, equipment_catalog, goals_data
 from bot.photo_guide import ASK_METHOD, GUIDE, SHOT_NAMES, SHOTS, next_shot_text
 from bot.db.database import Database
-from bot.services.places import ORDER, primary_place, user_places
+from bot.services import goals as goals_svc
+from bot.services.equipment import dump_gear, empty_gear, load_gear, merge_gear, parse_gear_text, render_gear
+from bot.services.llm import LLM
+from bot.services.location import COUNTRY_NAME, Location, parse_location
+from bot.services.places import ORDER, places_label, primary_place, user_places
 from bot.services.program_builder import template_for, build_day
 from bot.services.reminders import Reminders
 from bot.services.timeutil import (
-    TZ_PRESETS, WEEKDAYS_RU, fmt_days, local_today, next_training, parse_time, parse_tz,
+    WEEKDAYS_RU, fmt_days, local_today, next_training, parse_days, parse_time, pick_extra_days,
 )
-from bot.services.workout import describe_item
+from bot.services.workout import WorkoutService, describe_item
 from bot.ui import Ob, St, inline, main_menu
 
 router = Router()
@@ -34,7 +38,7 @@ MEASURES = [
 MEASURE_LABELS = {k: n for k, n, _ in MEASURES} | {"weight": "вес"}
 MEASURE_UNITS = {"weight": "кг"}
 
-GOALS = {"muscle": "💪 Набрать мышцы", "strength": "🏋️ Стать сильнее", "fit": "🤸 Общая форма и здоровье", "lose": "🔥 Похудеть"}
+GOALS = {k: g["name"] for k, g in goals_data().items()}
 LEVELS = {"new": "Новичок", "some": "Занимаюсь 3–12 месяцев"}
 PRESET_DAYS = {2: [0, 3], 3: [0, 2, 4], 4: [0, 1, 3, 4]}
 
@@ -52,7 +56,13 @@ class Onb(StatesGroup):
     days_n = State()
     days_pick = State()
     time = State()
+    extra = State()
     tz = State()
+    country = State()
+    goal_text = State()
+    goal2 = State()
+    gear = State()
+    gear_detail = State()
 
 
 def _num(text: str) -> float | None:
@@ -318,11 +328,46 @@ async def _finish_measure_update(message: Message, state: FSMContext, db: Databa
 # ---------- цель, уровень, место ----------
 async def _ask_goal(message: Message, state: FSMContext):
     data = await state.get_data()
-    keys = [k for k in GOALS if k != "lose" or data["age"] >= 18]
+    keys = goals_svc.goal_keys(data.get("age"))
     await state.set_state(Onb.goal)
+    rows = [[(GOALS[k], Ob(act="goal", arg=k))] for k in keys]
+    rows.append([("✍️ Написать самому", Ob(act="goal_text"))])
     await message.answer(
-        "<b>Главная цель?</b>",
-        reply_markup=inline([[(GOALS[k], Ob(act="goal", arg=k))] for k in keys]),
+        "<b>Какая у тебя главная цель?</b> Выбери кнопкой или напиши своими словами "
+        "(например: «хочу рельеф и выносливость»). От цели зависят повторы, кардио и растяжка.",
+        reply_markup=inline(rows),
+    )
+
+
+async def _after_goals(message: Message, state: FSMContext, db: Database):
+    """Цели выбраны: в анкете идём к уровню, в настройках сохраняем."""
+    data = await state.get_data()
+    if data.get("mode") == "goal":
+        await db.update_user(message.chat.id, goal=data["goal"], goal2=data.get("goal2"))
+        await state.clear()
+        about = goals_svc.goal_about(data["goal"])
+        await message.answer(
+            f"Цель: {goals_svc.goal_name(data['goal'])}. {about}\nНовые тренировки уже под неё: /plan",
+            reply_markup=main_menu(),
+        )
+        return
+    await state.set_state(Onb.level)
+    await message.answer(
+        "<b>Опыт в зале?</b>",
+        reply_markup=inline([[(v, Ob(act="level", arg=k))] for k, v in LEVELS.items()]),
+    )
+
+
+async def _ask_goal2(message: Message, state: FSMContext):
+    data = await state.get_data()
+    keys = [k for k in goals_svc.goal_keys(data.get("age")) if k != data["goal"]]
+    await state.set_state(Onb.goal2)
+    rows = [[(GOALS[k], Ob(act="goal2", arg=k))] for k in keys]
+    rows.append([("Достаточно одной цели", Ob(act="goal2", arg="-"))])
+    await message.answer(
+        f"Главная: {goals_svc.goal_name(data['goal'])}. {goals_svc.goal_about(data['goal'])}\n\n"
+        "<b>Добавить вторую цель?</b> Она влияет на кардио и растяжку.",
+        reply_markup=inline(rows),
     )
 
 
@@ -330,12 +375,45 @@ async def _ask_goal(message: Message, state: FSMContext):
 async def on_goal(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(goal=callback_data.arg)
-    await state.set_state(Onb.level)
+    await state.update_data(goal=callback_data.arg, goal2=None)
+    await _ask_goal2(cb.message, state)
+
+
+@router.callback_query(Ob.filter(F.act == "goal2"), Onb.goal2)
+async def on_goal2(cb: CallbackQuery, callback_data: Ob, state: FSMContext, db: Database):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(goal2=None if callback_data.arg == "-" else callback_data.arg)
+    await _after_goals(cb.message, state, db)
+
+
+@router.callback_query(Ob.filter(F.act == "goal_text"), Onb.goal)
+async def on_goal_text_btn(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(Onb.goal_text)
     await cb.message.answer(
-        "<b>Опыт в зале?</b>",
-        reply_markup=inline([[(v, Ob(act="level", arg=k))] for k, v in LEVELS.items()]),
+        "Напиши, чего хочешь. Например: «объём мышц», «рельеф», «сила», «выносливость, бегать 5 км», "
+        "«гибкость, сесть на шпагат». Можно несколько."
     )
+
+
+@router.message(Onb.goal_text, F.text, ~F.text.startswith("/"))
+async def on_goal_text(message: Message, state: FSMContext, db: Database):
+    data = await state.get_data()
+    found = goals_svc.parse_goals(message.text, data.get("age"))
+    if not found:
+        await message.answer(
+            "Не понял. Назови цель одним из слов: объём, рельеф, сила, выносливость, гибкость, "
+            "форма и здоровье. Или нажми /start и выбери кнопкой."
+        )
+        return
+    await state.update_data(goal=found[0], goal2=found[1] if len(found) > 1 else None)
+    await message.answer(
+        "Понял: " + goals_svc.goal_name(found[0]) + (f" и {goals_svc.goal_name(found[1])}" if len(found) > 1 else "")
+        + f".\n{goals_svc.goal_about(found[0])}"
+    )
+    await _after_goals(message, state, db)
 
 
 @router.callback_query(Ob.filter(F.act == "level"), Onb.level)
@@ -385,10 +463,19 @@ async def on_places_done(cb: CallbackQuery, state: FSMContext, db: Database):
     await cb.message.edit_text(f"Места: {', '.join(PLACES[p] for p in places)}. Основное: {PLACES[main]}.")
     if data.get("mode") == "places":
         await db.update_user(cb.from_user.id, place=main, places=",".join(places))
+        user = await db.get_user(cb.from_user.id)
+        if "home_db" in places and user:
+            await state.set_data({"mode": "gear", "gear": load_gear(user)})
+            await _ask_gear(cb.message, state, standalone=True)
+            return
         await state.clear()
         await cb.message.answer("Сохранил. Новые тренировки уже под это. Смотри: /plan", reply_markup=main_menu())
         return
     await state.update_data(place=main, places=places)
+    if "home_db" in places:
+        await state.update_data(gear=empty_gear())
+        await _ask_gear(cb.message, state)
+        return
     await _ask_days_n(cb.message, state)
 
 
@@ -398,6 +485,153 @@ async def settings_places(cb: CallbackQuery, state: FSMContext, db: Database):
     user = await db.get_user(cb.from_user.id)
     await state.set_data({"mode": "places"})
     await _ask_places(cb.message, state, set(user_places(user)) if user else set())
+
+
+# ---------- инвентарь дома ----------
+_WEIGHTED = {"dumbbell", "kettlebell", "band", "expander"}
+
+
+def _gear_kb(gear: dict):
+    have = {i["id"] for i in gear["items"]}
+    rows, row = [], []
+    for c in equipment_catalog():
+        row.append((("✅ " if c["id"] in have else "") + c["name"], Ob(act="gt", arg=c["id"])))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("🗑 Очистить", Ob(act="gclear")), ("Готово ➡", Ob(act="gdone"))])
+    return inline(rows)
+
+
+async def _ask_gear(message: Message, state: FSMContext, standalone: bool = False):
+    data = await state.get_data()
+    gear = data.get("gear") or empty_gear()
+    await state.set_state(Onb.gear)
+    await message.answer(
+        "<b>Что у тебя есть дома?</b> Отметь кнопками или <b>напиши списком</b> со всеми деталями: "
+        "веса гантелей и гирь, сопротивление резинок и эспандера, что ещё есть. Например:\n"
+        "<i>«одна гантель 5 кг, турник, резинка 25 кг, эспандер 25 кг, скакалка, беговая дорожка»</i>\n\n"
+        "Программа будет только из того, что у тебя есть, и с твоими весами.\n\n"
+        f"<b>Сейчас записано</b>\n{render_gear(gear)}",
+        reply_markup=_gear_kb(gear),
+    )
+
+
+async def _gear_update(message: Message, state: FSMContext, items: list[dict], other: list[str]):
+    data = await state.get_data()
+    gear = merge_gear(data.get("gear") or empty_gear(), items, other)
+    await state.update_data(gear=gear)
+    await message.answer(
+        f"Записал.\n{render_gear(gear)}\n\nЕщё что-то? Допиши текстом или жми «Готово».",
+        reply_markup=_gear_kb(gear),
+    )
+
+
+@router.callback_query(Ob.filter(F.act == "gt"), Onb.gear)
+async def on_gear_toggle(cb: CallbackQuery, callback_data: Ob, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    gear = data.get("gear") or empty_gear()
+    gid = callback_data.arg
+    if any(i["id"] == gid for i in gear["items"]):
+        gear["items"] = [i for i in gear["items"] if i["id"] != gid]
+        await state.update_data(gear=gear)
+        await cb.message.edit_reply_markup(reply_markup=_gear_kb(gear))
+        return
+    gear["items"].append({"id": gid})
+    await state.update_data(gear=gear, gear_pending=gid)
+    await cb.message.edit_reply_markup(reply_markup=_gear_kb(gear))
+    if gid in _WEIGHTED:
+        await state.set_state(Onb.gear_detail)
+        hint = {
+            "dumbbell": "Сколько гантелей и какого веса? «2 по 5 кг», «одна 8 кг», «разборные до 20 кг»",
+            "kettlebell": "Какой вес гири? «16 кг» или «8 и 12 кг»",
+            "band": "Какое сопротивление? «25 кг», «10, 20 и 30 кг» или «лёгкая и средняя»",
+            "expander": "Какое сопротивление? «25 кг»",
+        }[gid]
+        await cb.message.answer(hint + ". Если не знаешь, нажми «Не знаю».",
+                                reply_markup=inline([[("Не знаю", Ob(act="gskip"))]]))
+
+
+@router.callback_query(Ob.filter(F.act == "gskip"), Onb.gear_detail)
+async def on_gear_skip(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(Onb.gear)
+    gear = (await state.get_data()).get("gear") or empty_gear()
+    await cb.message.answer("Ок, без точных весов.", reply_markup=_gear_kb(gear))
+
+
+@router.message(Onb.gear_detail, F.text, ~F.text.startswith("/"))
+async def on_gear_detail(message: Message, state: FSMContext):
+    data = await state.get_data()
+    gid = data.get("gear_pending", "dumbbell")
+    name = next((c["name"] for c in equipment_catalog() if c["id"] == gid), gid)
+    items, other = parse_gear_text(f"{name} {message.text}")
+    await state.set_state(Onb.gear)
+    mine = [i for i in items if i["id"] == gid]
+    await _gear_update(message, state, mine, [])
+
+
+@router.message(Onb.gear, F.text, ~F.text.startswith("/"))
+async def on_gear_text(message: Message, state: FSMContext, db: Database, llm: LLM, settings):
+    items, other = parse_gear_text(message.text)
+    if (not items or other) and len(message.text) > 3 and llm.available and await db.take_quota(
+        message.from_user.id, "llm", settings.limit_llm_per_day
+    ):
+        smart = await llm.extract_gear(message.text)
+        if smart:
+            items, other = smart[0] or items, smart[1]
+    if not items and not other:
+        await message.answer("Не понял. Напиши, например: «гантели 2 по 8 кг, турник, резинка 25 кг».")
+        return
+    await _gear_update(message, state, items, other)
+
+
+@router.callback_query(Ob.filter(F.act == "gclear"), Onb.gear)
+async def on_gear_clear(cb: CallbackQuery, state: FSMContext):
+    await cb.answer("Очистил")
+    await state.update_data(gear=empty_gear())
+    await cb.message.edit_reply_markup(reply_markup=_gear_kb(empty_gear()))
+
+
+@router.callback_query(Ob.filter(F.act == "gdone"), Onb.gear)
+async def on_gear_done(cb: CallbackQuery, state: FSMContext, db: Database, workouts: WorkoutService):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    data = await state.get_data()
+    gear = data.get("gear") or empty_gear()
+    if data.get("mode") == "gear":
+        await db.update_user(cb.from_user.id, equipment=dump_gear(gear))
+        user = await db.get_user(cb.from_user.id)
+        if user:
+            await workouts.refresh_planned(user)
+        await state.clear()
+        await cb.message.answer(
+            f"Инвентарь сохранён:\n{render_gear(gear)}\n\nПрограмма пересобрана под него: /plan",
+            reply_markup=main_menu(),
+        )
+        return
+    await cb.message.answer(f"Инвентарь:\n{render_gear(gear)}")
+    await _ask_days_n(cb.message, state)
+
+
+@router.callback_query(St.filter(F.act == "gear"))
+async def settings_gear(cb: CallbackQuery, state: FSMContext, db: Database):
+    await cb.answer()
+    user = await db.get_user(cb.from_user.id)
+    await state.set_data({"mode": "gear", "gear": load_gear(user)})
+    await _ask_gear(cb.message, state, standalone=True)
+
+
+@router.callback_query(St.filter(F.act == "goal"))
+async def settings_goal(cb: CallbackQuery, state: FSMContext, db: Database):
+    await cb.answer()
+    user = await db.get_user(cb.from_user.id)
+    await state.set_data({"mode": "goal", "age": (user or {}).get("age")})
+    await _ask_goal(cb.message, state)
 
 
 # ---------- расписание ----------
@@ -472,18 +706,8 @@ async def on_days_done(cb: CallbackQuery, state: FSMContext):
 
 
 async def _after_time(message: Message, state: FSMContext, time_str: str, db: Database, rem: Reminders):
-    data = await state.get_data()
     await state.update_data(train_time=time_str)
-    if data["mode"] == "sched":
-        user = await db.get_user(message.chat.id)
-        assert user
-        await db.update_user(user["tg_id"], days_per_week=data["days_per_week"],
-                             days=",".join(map(str, data["days"])), train_time=time_str, rotation_idx=0)
-        rem.schedule_user((await db.get_user(user["tg_id"])))  # type: ignore[arg-type]
-        await state.clear()
-        await message.answer("Расписание обновлено. Напомню вовремя.", reply_markup=main_menu())
-        return
-    await _ask_tz(message, state)
+    await _ask_extra(message, state, db)
 
 
 @router.message(Onb.time)
@@ -495,44 +719,121 @@ async def on_time_text(message: Message, state: FSMContext, db: Database, remind
     await _after_time(message, state, t, db, reminders)
 
 
-# ---------- часовой пояс ----------
-async def _ask_tz(message: Message, state: FSMContext):
-    await state.set_state(Onb.tz)
-    rows = [[(name, Ob(act="tz", arg=str(i)))] for i, (name, _) in enumerate(TZ_PRESETS)]
+# ---------- дополнительные дни: кардио или гибкость ----------
+async def _ask_extra(message: Message, state: FSMContext, db: Database):
+    data = await state.get_data()
+    uid = message.chat.id
+    if "goal" not in data:  # настройки: цель берём из профиля
+        user = await db.get_user(uid)
+        await state.update_data(goal=(user or {}).get("goal"), goal2=(user or {}).get("goal2"))
+        data = await state.get_data()
+    rec = goals_svc.extra_days(data.get("goal"), data.get("goal2"))
+    kind = "гибкости и растяжки" if goals_svc.extra_kind(data.get("goal")) == "flex" else "кардио"
+    await state.set_state(Onb.extra)
     await message.answer(
-        "<b>Часовой пояс?</b> Нужен, чтобы напоминания приходили вовремя. Выбери из списка или "
-        "напиши смещение, например +4.",
-        reply_markup=inline(rows),
+        f"<b>Дополнительные дни для {kind}?</b> Бег, велосипед и велодорожки, дорожка, скакалка или ходьба "
+        "— зависит от того, что у тебя есть. Отдельные дни, не вместо силовых.\n"
+        f"По твоей цели рекомендую: {rec}.",
+        reply_markup=inline([[((f"{n}" + (" ✅ рекомендую" if n == rec else "")), Ob(act="x", arg=str(n))) for n in range(4)]]),
     )
 
 
-async def _after_tz(message: Message, state: FSMContext, tz: str, db: Database, rem: Reminders):
-    data = await state.get_data()
-    if data["mode"] == "tz":
-        user = await db.get_user(message.chat.id)
-        assert user
-        await db.update_user(user["tg_id"], tz=tz)
-        rem.schedule_user((await db.get_user(user["tg_id"])))  # type: ignore[arg-type]
-        await state.clear()
-        await message.answer(f"Часовой пояс: {tz}.", reply_markup=main_menu())
-        return
-    await _finalize(message, state, tz, db, rem)
-
-
-@router.callback_query(Ob.filter(F.act == "tz"), Onb.tz)
-async def on_tz_btn(cb: CallbackQuery, callback_data: Ob, state: FSMContext, db: Database, reminders: Reminders):
+@router.callback_query(Ob.filter(F.act == "x"), Onb.extra)
+async def on_extra(cb: CallbackQuery, callback_data: Ob, state: FSMContext, db: Database, reminders: Reminders):
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
-    await _after_tz(cb.message, state, TZ_PRESETS[int(callback_data.arg)][1], db, reminders)
+    data = await state.get_data()
+    if data.get("mode") == "extra":
+        user = await db.get_user(cb.from_user.id)
+        strength = parse_days(user["days"]) if user else []
+    else:
+        strength = sorted(data.get("days", []))
+    n = int(callback_data.arg)
+    extra = pick_extra_days(strength, n)
+    await state.update_data(cardio_days=extra)
+    if extra:
+        await cb.message.answer("Дополнительные дни: " + fmt_days(extra) + ". Поменять можно в настройках.")
+    if data.get("mode") in ("sched", "extra"):
+        await _save_schedule(cb.message, state, db, reminders)
+        return
+    await _ask_tz(cb.message, state)
+
+
+async def _save_schedule(message: Message, state: FSMContext, db: Database, rem: Reminders):
+    data = await state.get_data()
+    uid = message.chat.id
+    fields: dict = {"cardio_days": ",".join(map(str, data.get("cardio_days", [])))}
+    if data["mode"] == "sched":
+        fields.update(days_per_week=data["days_per_week"], days=",".join(map(str, data["days"])),
+                      train_time=data["train_time"], rotation_idx=0)
+    await db.update_user(uid, **fields)
+    rem.schedule_user((await db.get_user(uid)))  # type: ignore[arg-type]
+    await state.clear()
+    await message.answer("Расписание обновлено. Напомню вовремя.", reply_markup=main_menu())
+
+
+@router.callback_query(St.filter(F.act == "extra"))
+async def settings_extra(cb: CallbackQuery, state: FSMContext, db: Database):
+    await cb.answer()
+    await state.set_data({"mode": "extra"})
+    await _ask_extra(cb.message, state, db)
+
+
+# ---------- город и часовой пояс ----------
+async def _ask_tz(message: Message, state: FSMContext):
+    await state.set_state(Onb.tz)
+    await message.answer(
+        "<b>В каком ты городе?</b> Напиши город, например <i>Алматы</i> или <i>Москва</i>. "
+        "Если города нет в моём списке, напиши часовой пояс: <i>+5</i> или <i>UTC+3</i>. "
+        "Нужно для напоминаний и чтобы подобрать магазины добавок в твоей стране."
+    )
+
+
+async def _after_loc(message: Message, state: FSMContext, loc: Location, db: Database, rem: Reminders):
+    data = await state.get_data()
+    await state.update_data(tz=loc.tz, country=loc.country, city=loc.city)
+    if data["mode"] == "tz":
+        await db.update_user(message.chat.id, tz=loc.tz, country=loc.country, city=loc.city)
+        rem.schedule_user((await db.get_user(message.chat.id)))  # type: ignore[arg-type]
+        await state.clear()
+        where = ", ".join(x for x in (loc.city, COUNTRY_NAME.get(loc.country or "")) if x)
+        await message.answer(f"Записал: {where or loc.tz}. Пояс: {loc.tz}.", reply_markup=main_menu())
+        return
+    if not loc.country:
+        await state.set_state(Onb.country)
+        await message.answer(
+            "Из какой ты страны? Нужно для подбора магазинов добавок. Напиши, например, "
+            "<i>Казахстан</i>, или «пропустить».",
+            reply_markup=inline([[("Пропустить", Ob(act="cskip"))]]),
+        )
+        return
+    await _finalize(message, state, loc.tz, db, rem)
 
 
 @router.message(Onb.tz)
 async def on_tz_text(message: Message, state: FSMContext, db: Database, reminders: Reminders):
-    tz = parse_tz(message.text or "")
-    if not tz:
-        await message.answer("Не понял. Напиши смещение (+3, -5) или название вида Europe/Moscow.")
+    loc = parse_location(message.text or "")
+    if not loc:
+        await message.answer("Не нашёл такой город. Напиши часовой пояс: <i>+3</i>, <i>+5</i> или <i>Europe/Berlin</i>.")
         return
-    await _after_tz(message, state, tz, db, reminders)
+    await _after_loc(message, state, loc, db, reminders)
+
+
+@router.message(Onb.country, F.text, ~F.text.startswith("/"))
+async def on_country(message: Message, state: FSMContext, db: Database, reminders: Reminders):
+    loc = parse_location(message.text or "")
+    data = await state.get_data()
+    country = loc.country if loc and loc.country else None
+    await state.update_data(country=country)
+    await _finalize(message, state, data["tz"], db, reminders)
+
+
+@router.callback_query(Ob.filter(F.act == "cskip"), Onb.country)
+async def on_country_skip(cb: CallbackQuery, state: FSMContext, db: Database, reminders: Reminders):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    data = await state.get_data()
+    await _finalize(cb.message, state, data["tz"], db, reminders)
 
 
 @router.callback_query(St.filter(F.act == "tz"))
@@ -556,7 +857,11 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     days = data["days"]
     await db.update_user(
         tg_id, age=data["age"], weight_kg=data["weight"], height_cm=data["height"], goal=data["goal"],
-        level=data["level"], place=data["place"], places=",".join(data.get("places") or [data["place"]]),
+        goal2=data.get("goal2"), level=data["level"], place=data["place"],
+        places=",".join(data.get("places") or [data["place"]]),
+        equipment=dump_gear(data.get("gear") or empty_gear()),
+        cardio_days=",".join(map(str, data.get("cardio_days", []))),
+        city=data.get("city"), country=data.get("country"),
         days_per_week=data["days_per_week"],
         days=",".join(map(str, days)), train_time=data["train_time"], tz=tz, rotation_idx=0, onboarded=1,
     )
@@ -570,15 +875,18 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     await state.clear()
 
     tpl = template_for(user["days_per_week"], 0)
-    plan = build_day(tpl, user["place"])
+    plan = build_day(tpl, user)
     nxt = next_training(days, user["train_time"], tz)
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
     items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in plan)
+    extra = parse_days(user.get("cardio_days"))
+    extra_line = f"\nДополнительные дни ({goals_svc.extra_kind(user['goal'])}): {fmt_days(extra)}." if extra else ""
     await message.answer(
-        f"Готово. Программа: {user['days_per_week']} трен./нед ({fmt_days(days)} в {user['train_time']}), "
-        f"{PLACES[user['place']]}.\n\n<b>Первая тренировка — {html.escape(tpl['name'])}</b>\n{items}\n\n"
+        f"Готово. Цель: {goals_svc.goal_name(user['goal'])}. Программа: {user['days_per_week']} трен./нед "
+        f"({fmt_days(days)} в {user['train_time']}), {places_label(user_places(user))}.{extra_line}\n\n"
+        f"<b>Первая тренировка — {html.escape(tpl['name'])}</b>\n{items}\n\n"
         f"Напомню: {when}. Хочешь начать раньше — кнопка «Тренировка».\n"
-        "На первой тренировке вес подбирается легко. Я подскажу, как.",
+        "Перед каждой тренировкой я дам разминку, после неё растяжку. Вес на первое упражнение подскажу сам.",
         reply_markup=main_menu(),
     )
 

@@ -10,17 +10,20 @@ from aiogram.types import CallbackQuery, Message
 
 from bot.cards import send_exercise_card
 from bot.config import Settings
-from bot.data import PLACES, get_exercise
+from bot.data import PLACES, flex_template, get_exercise, warmup_data
 from bot.db.database import Database
 from bot.prompts import DEBRIEF_PROMPT, system_prompt
 from bot.services.debrief import template_debrief, workout_facts
 from bot.services.llm import LLM, LLMError
+from bot.services import cardio as cardio_svc
+from bot.services import equipment
 from bot.services.places import user_places
 from bot.services.profile import build_profile
 from bot.services.progression import FEEL_LABELS, Feel
 from bot.services.reminders import Reminders
 from bot.services.set_parser import ParsedSet, detect_feel, mentions_pain, parse_set
 from bot.services.start_weights import is_hand
+from bot.services.warmup import cooldown, ramp_line, warmup_text
 from bot.services.timeutil import WEEKDAYS_RU, local_today, next_training, parse_days
 from bot.services.workout import SetOutcome, WorkoutService, describe_item
 from bot.textfmt import format_llm
@@ -54,6 +57,8 @@ def _now() -> str:
 
 
 def fmt_set(kind: str, weight: float, reps: int) -> str:
+    if kind == "cardio":
+        return f"{reps} мин" + (f", {fmt_num(weight)} км" if weight else "")
     if kind == "weight":
         return f"{fmt_num(weight)} кг × {reps}"
     if kind == "time":
@@ -84,21 +89,41 @@ def set_prompt(w: dict, item: dict, first: bool = False) -> str:
             f"{head} Бери <b>{fmt_num(w['cur_weight'])} кг{hand}</b>, цель {reps} повторов.\n"
             f"Сделал — напиши «вес повторы», например <code>{fmt_num(w['cur_weight'])} {w['cur_reps']}</code>."
         )
+    if kind == "cardio":
+        return (
+            f"{head} Цель {w['cur_reps']} мин.\nКогда закончишь, напиши минуты, например "
+            f"<code>{w['cur_reps']}</code> или с дистанцией <code>{w['cur_reps']} мин 4 км</code>."
+        )
     if kind == "time":
         return f"{head} Держи {w['cur_reps']} сек.\nНапиши, сколько продержался, например <code>{w['cur_reps']}</code>."
     return f"{head} Цель {w['cur_reps']} повт.\nНапиши, сколько сделал, например <code>{w['cur_reps']}</code>."
 
 
-def exercise_text(w: dict, item: dict, ex, target, last: list[dict]) -> str:
-    unit = {"weight": "повт.", "reps": "повт.", "time": "сек"}[item["kind"]]
+def exercise_text(w: dict, item: dict, ex, target, last: list[dict], extra: str = "", ramp: str | None = None) -> str:
+    kind = item["kind"]
+    if kind == "cardio":
+        lines = [f"<b>{w['ex_i'] + 1}/{len(w['plan'])} · {html.escape(ex.name)}</b>", f"Цель: {w['cur_reps']} мин"]
+        if last:
+            lines.append("Прошлый раз: " + ", ".join(fmt_set(kind, s["weight"], s["reps"]) for s in last))
+            lines.append(f"<i>{html.escape(target.note)}</i>")
+        if extra:
+            lines.append(html.escape(extra))
+        lines.append("\n<b>Советы</b>\n" + "\n".join(f"• {html.escape(c)}" for c in ex.cues))
+        lines.append("\n" + set_prompt(w, item))
+        return "\n".join(lines)
+    unit = {"weight": "повт.", "reps": "повт.", "time": "сек"}[kind]
     lines = [
         f"<b>{w['ex_i'] + 1}/{len(w['plan'])} · {html.escape(ex.name)}</b>",
         f"{item['sets']} подх. × {item['lo']}–{item['hi']} {unit}",
     ]
     if last:
-        lines.append("Прошлый раз: " + ", ".join(fmt_set(item["kind"], s["weight"], s["reps"]) for s in last))
+        lines.append("Прошлый раз: " + ", ".join(fmt_set(kind, s["weight"], s["reps"]) for s in last))
         lines.append(f"<i>{html.escape(target.note)}</i>")
     lines.append("\n<b>Техника</b>\n" + "\n".join(f"• {html.escape(c)}" for c in ex.cues))
+    if extra:
+        lines.append("\n" + html.escape(extra))
+    if ramp:
+        lines.append("\n" + html.escape(ramp))
     lines.append("\n" + set_prompt(w, item, first=not last))
     return "\n".join(lines)
 
@@ -107,13 +132,25 @@ async def show_exercise(msg: Message, w: dict, workouts: WorkoutService, with_me
     item = w["plan"][w["ex_i"]]
     ex = get_exercise(item["ex_id"])
     assert ex
-    target, last = await workouts.target_for(w["tg_id"], item, w["id"])
+    target, last = await workouts.target_for(w["tg_id"], item, w["id"], w["place"])
+    extra, ramp = "", None
+    user = await workouts.db.get_user(w["tg_id"])
+    if item["kind"] == "cardio" and user:
+        n_done = await workouts.db.count_workouts_with(w["tg_id"], ex.id)
+        extra = cardio_svc.card_note(ex, user, n_done, user.get("level"))
+    elif item["kind"] == "weight":
+        if w["ex_i"] == 0 and w["set_i"] == 0:
+            ramp = ramp_line(w["cur_weight"], fmt_num)
+        if user and ex.equip == "dumbbell" and equipment.single_dumbbell(user, w["place"]):
+            extra = "У тебя одна гантель: делай каждой рукой по очереди."
     markup = inline([
         [("📖 Подробно", Ex(act="steps", id=ex.id)), ("📹 YouTube", ex.video_url)],
         [("🔄 Заменить", Wk(act="swap", wid=w["id"])), ("⏭ Пропустить", Wk(act="skipex", wid=w["id"]))],
         [("🏁 Закончить тренировку", Wk(act="finish", wid=w["id"]))],
     ])
-    await send_exercise_card(msg, ex, workouts.edb, exercise_text(w, item, ex, target, last), markup, with_media=with_media)
+    await send_exercise_card(
+        msg, ex, workouts.edb, exercise_text(w, item, ex, target, last, extra, ramp), markup, with_media=with_media
+    )
 
 
 async def start_workout(msg: Message, w: dict, db: Database, workouts: WorkoutService) -> None:
@@ -121,7 +158,11 @@ async def start_workout(msg: Message, w: dict, db: Database, workouts: WorkoutSe
     w = await workouts.start(w["id"], _now())
     if first_time:
         await msg.answer(INTRO)
-    await show_exercise(msg, w, workouts)
+    text, gifs = warmup_text(w["plan"])
+    rows = [[(f"📺 Шаг {n}", Ex(act="db", id=g)) for n, g in enumerate(gifs[i:i + 3], i + 1)] for i in range(0, len(gifs), 3)]
+    rows.append([("✅ Размялся, начинаем", Wk(act="warm", wid=w["id"]))])
+    rows.append([("⏭ Пропустить разминку", Wk(act="warm", wid=w["id"]))])
+    await msg.answer(text, reply_markup=inline(rows))
 
 
 async def after_outcome(
@@ -154,6 +195,18 @@ async def send_debrief(msg: Message, w: dict, user: dict, db: Database, llm: LLM
     await msg.answer("🧠 <b>Разбор тренера</b>\n" + (text or html.escape(template_debrief(stats))))
 
 
+async def send_cooldown(msg: Message, w: dict) -> None:
+    """Растяжка на мышцы, которые работали сегодня."""
+    stretches = cooldown(w["plan"])
+    if not stretches or w["day_name"] == flex_template()["name"]:
+        return
+    lines = [f"{n}. {html.escape(s.name)}" for n, s in enumerate(stretches, 1)]
+    await msg.answer(
+        "🧘 <b>Растяжка, 5 минут</b>\n" + html.escape(warmup_data()["cooldown_intro"]) + "\n\n" + "\n".join(lines),
+        reply_markup=inline([[(f"📺 {s.name.split(' (')[0][:28]}", Ex(act="cur", id=s.id))] for s in stretches]),
+    )
+
+
 async def finish_workout(
     msg: Message, w: dict, db: Database, workouts: WorkoutService, llm: LLM, settings: Settings,
     early: bool = False,
@@ -172,6 +225,7 @@ async def finish_workout(
         f"Серия: {res['streak']} подряд.\nСледующая: {when}."
     )
     await send_debrief(msg, w, user, db, llm, settings)
+    await send_cooldown(msg, w)
 
 
 # ---------- вспомогательные ----------
@@ -292,6 +346,10 @@ async def on_workout_button(
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
     act = callback_data.act
+    if act == "warm":
+        await db.update_workout(w["id"], warm=1)
+        await show_exercise(cb.message, w, workouts)
+        return
     if act == "swap":
         if await workouts.swap_exercise(w["id"]):
             w = await db.get_workout(w["id"])
@@ -365,6 +423,8 @@ async def process_set_text(
     """Пытается принять текст как подход или самочувствие. False = это не про тренировку (пусть отвечает чат)."""
     item = w["plan"][w["ex_i"]]
     has_digits = any(c.isdigit() for c in text)
+    if not w.get("warm", 1):
+        await db.update_workout(w["id"], warm=1)  # человек уже работает: разминку не навязываем
     if mentions_pain(text) and len(text) < 160:
         await _pain_stop(message, w, db)
         return True
