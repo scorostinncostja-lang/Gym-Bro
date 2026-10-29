@@ -78,6 +78,15 @@ CREATE TABLE IF NOT EXISTS stack (
     supp_id TEXT NOT NULL,
     PRIMARY KEY (tg_id, supp_id)
 );
+CREATE TABLE IF NOT EXISTS progress_media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    kind TEXT NOT NULL,        -- photo | video_note | video
+    label TEXT NOT NULL,       -- front | side | back | flex | clip
+    file_id TEXT NOT NULL      -- файл лежит у Telegram, у нас только ссылка
+);
+CREATE INDEX IF NOT EXISTS ix_media ON progress_media(tg_id, day);
 CREATE TABLE IF NOT EXISTS chat (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     tg_id INTEGER NOT NULL,
@@ -96,7 +105,7 @@ WORKOUT_FIELDS = {
     "started_at", "finished_at", "plan", "place",
 }
 
-_TABLES_BY_USER = ("measurements", "workouts", "sets", "usage", "stack", "chat", "users")
+_TABLES_BY_USER = ("measurements", "workouts", "sets", "usage", "stack", "chat", "progress_media", "users")
 
 
 def _now() -> str:
@@ -169,6 +178,28 @@ class Database:
         for table in _TABLES_BY_USER:
             await self.db.execute(f"DELETE FROM {table} WHERE tg_id=?", (tg_id,))
         await self.db.commit()
+
+    # ---------- прогресс-фото ----------
+    async def add_progress_media(self, tg_id: int, day: str, items: list[tuple[str, str, str]]) -> None:
+        """items: (kind, label, file_id). Повторная съёмка в тот же день заменяет прежнюю."""
+        await self.db.execute("DELETE FROM progress_media WHERE tg_id=? AND day=?", (tg_id, day))
+        for kind, label, file_id in items:
+            await self.db.execute(
+                "INSERT INTO progress_media(tg_id, day, kind, label, file_id) VALUES(?,?,?,?,?)",
+                (tg_id, day, kind, label, file_id),
+            )
+        await self.db.commit()
+
+    async def progress_days(self, tg_id: int) -> list[str]:
+        rows = await self._all(
+            "SELECT DISTINCT day FROM progress_media WHERE tg_id=? ORDER BY day", (tg_id,)
+        )
+        return [r["day"] for r in rows]
+
+    async def progress_media_on(self, tg_id: int, day: str) -> list[dict]:
+        return await self._all(
+            "SELECT kind, label, file_id FROM progress_media WHERE tg_id=? AND day=? ORDER BY id", (tg_id, day)
+        )
 
     # ---------- measurements ----------
     async def add_measurements(self, tg_id: int, values: dict[str, float], day: str) -> None:

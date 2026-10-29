@@ -30,7 +30,8 @@ HELP = """\
 🏋️ /today — тренировка сегодня (в зале или дома)
 📅 /plan — твоя программа
 📊 /stats — прогресс, серия, рабочие веса
-📏 /measure — новые замеры
+📏 /measure — новые замеры: лента, фото или кружок
+📸 /progress — фото «было → стало», /photo_guide — как снимать
 💊 /supplements — что работает, а что маркетинг
 🔎 /exercise присед — анимация и техника (русский или английский)
 📚 /library — каталог упражнений по группам мышц
@@ -46,13 +47,14 @@ HELP = """\
 PRIVACY = """\
 <b>Что хранится</b>
 • Возраст, рост, вес, замеры, цель, расписание, история подходов.
+• Фото и кружки для «было → стало»: только ссылка на файл у Telegram, сами файлы я не копирую.
 • Последние ~20 реплик диалога для контекста.
 
 <b>Куда уходят данные</b>
 • Текст вопросов, фото еды и видео техники отправляются в Google Gemini или Groq для ответа. \
 Голосовые — в Groq для расшифровки. Telegram-ник и ID туда не передаются.
-• Фото и видео я не сохраняю, анализ идёт «на лету».
-• Фото тела не анализирую.
+• Фото еды и видео техники не сохраняются, анализ идёт «на лету».
+• Фото и кружки тела никуда не отправляются и ИИ не анализируются: они только для твоего сравнения.
 
 Удалить всё: /delete_me."""
 
@@ -90,7 +92,7 @@ async def cmd_plan(message: Message, db: Database):
 
 
 # ---------- /stats ----------
-@router.message(Command("stats", "progress"))
+@router.message(Command("stats"))
 @router.message(F.text == BTN_STATS)
 async def cmd_stats(message: Message, db: Database):
     user = await db.get_user(message.from_user.id)
@@ -299,7 +301,7 @@ async def settings_setplace(cb: CallbackQuery, callback_data: St, db: Database):
 async def settings_del(cb: CallbackQuery):
     await cb.answer()
     await cb.message.answer(
-        "Удалить всё: профиль, замеры, историю тренировок? Это необратимо.",
+        "Удалить всё: профиль, замеры, фото, историю тренировок? Это необратимо.",
         reply_markup=inline([[("Да, удалить", St(act="delyes")), ("Отмена", St(act="delno"))]]),
     )
 
@@ -307,7 +309,7 @@ async def settings_del(cb: CallbackQuery):
 @router.message(Command("delete_me"))
 async def cmd_delete(message: Message):
     await message.answer(
-        "Удалить всё: профиль, замеры, историю тренировок? Это необратимо.",
+        "Удалить всё: профиль, замеры, фото, историю тренировок? Это необратимо.",
         reply_markup=inline([[("Да, удалить", St(act="delyes")), ("Отмена", St(act="delno"))]]),
     )
 

@@ -1,4 +1,5 @@
 """Анкета, замеры и перенастройка расписания (FSM)."""
+import asyncio
 import html
 
 from aiogram import F, Router
@@ -8,6 +9,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from bot.data import PLACES
+from bot.photo_guide import ASK_METHOD, GUIDE, SHOT_NAMES, SHOTS, next_shot_text
 from bot.db.database import Database
 from bot.services.program_builder import template_for, build_day
 from bot.services.reminders import Reminders
@@ -41,7 +43,9 @@ class Onb(StatesGroup):
     age = State()
     weight = State()
     height = State()
+    method = State()
     measure = State()
+    photos = State()
     goal = State()
     level = State()
     place = State()
@@ -74,8 +78,8 @@ async def cmd_start(message: Message, state: FSMContext, db: Database):
     await message.answer(
         "Я Gym Bro. Соберу программу под твой инвентарь, буду напоминать о тренировках, "
         "считать прогрессию и отвечать на вопросы по технике.\n\n"
-        "Анкета займёт 3 минуты. Лучше заранее взять мягкую ленту (сантиметр): "
-        "понадобятся замеры.\n\n<b>Сколько тебе лет?</b>"
+        "Анкета займёт 3 минуты. Замеры тела можно сделать лентой, фото или кружком, "
+        "а можно пропустить: лента не обязательна.\n\n<b>Сколько тебе лет?</b>"
     )
     await state.set_state(Onb.age)
 
@@ -97,9 +101,10 @@ async def on_age(message: Message, state: FSMContext):
     await state.update_data(age=age)
     if age < 18:
         await message.answer(
-            "Тебе нет 18, поэтому у меня особые правила: никаких диет, доз добавок и "
-            "работы на максимум. Техника и регулярность важнее веса. Первые 2–3 тренировки "
-            "лучше сходить с тренером или взрослым, который покажет базовые движения."
+            "Тебе нет 18, поэтому у меня особые правила: никаких диет, стимуляторов и работы на "
+            "максимум. Из добавок только безопасные и в малых дозах (/supplements). Техника и "
+            "регулярность важнее веса. Первые 2–3 тренировки лучше сходить с тренером или "
+            "взрослым, который покажет базовые движения."
         )
     await message.answer("<b>Вес в кг?</b> (например 62 или 62,5)")
     await state.set_state(Onb.weight)
@@ -131,13 +136,103 @@ async def on_height(message: Message, state: FSMContext):
 
 
 # ---------- замеры ----------
+_media_lock = asyncio.Lock()
+
+
+def _skip_kb(text: str = "⏭ Пропустить"):
+    return inline([[(text, Ob(act="pdone"))]])
+
+
 async def _start_measures(message: Message, state: FSMContext):
-    await state.update_data(m_idx=0, m_vals={})
+    await state.update_data(m_idx=0, m_vals={}, p_media=[])
+    await state.set_state(Onb.method)
     await message.answer(
-        "Теперь замеры лентой. Делай утром, расслабленно, ленту не затягивай. "
-        "Любой замер можно пропустить."
+        ASK_METHOD,
+        reply_markup=inline([
+            [("📏 Лентой", Ob(act="mtape"))],
+            [("📸 Фото или кружок", Ob(act="mphoto"))],
+            [("⏭ Пропущу", Ob(act="mnone"))],
+        ]),
     )
-    await _ask_measure(message, state)
+
+
+@router.callback_query(Ob.filter(F.act == "mtape"), Onb.method)
+async def on_method_tape(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await cb.message.answer(
+        "Замеры лентой. Делай утром, расслабленно, ленту не затягивай. Любой замер можно пропустить."
+    )
+    await _ask_measure(cb.message, state)
+
+
+@router.callback_query(Ob.filter(F.act == "mphoto"), Onb.method)
+async def on_method_photo(cb: CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await state.set_state(Onb.photos)
+    await cb.message.answer(GUIDE)
+    await cb.message.answer(
+        "Пришли <b>4 фото</b> по порядку или один <b>кружок</b>. Не получилось сейчас — пропусти, "
+        "можно потом через /measure.\n\n" + next_shot_text(0),
+        reply_markup=_skip_kb(),
+    )
+
+
+@router.callback_query(Ob.filter(F.act == "mnone"), Onb.method)
+async def on_method_none(cb: CallbackQuery, state: FSMContext, db: Database):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    await _after_measures(cb.message, state, db)
+
+
+async def _after_measures(message: Message, state: FSMContext, db: Database):
+    data = await state.get_data()
+    if data["mode"] == "onb":
+        await _ask_goal(message, state)
+    else:
+        await _finish_measure_update(message, state, db)
+
+
+@router.message(Onb.photos, F.photo | F.video_note | F.video)
+async def on_progress_media(message: Message, state: FSMContext, db: Database):
+    # Альбом приходит пачкой апдейтов: без замка счётчик кадров сбивается.
+    async with _media_lock:
+        media = list((await state.get_data()).get("p_media", []))
+        if message.photo:
+            if len(media) >= len(SHOTS) or (media and media[0][0] != "photo"):
+                return
+            label = SHOTS[len(media)][0]
+            media.append(["photo", label, message.photo[-1].file_id])
+            await state.update_data(p_media=media)
+            if len(media) < len(SHOTS):
+                await message.answer(
+                    f"✔ Принял: {SHOT_NAMES[label]}.\n{next_shot_text(len(media))}",
+                    reply_markup=_skip_kb("Хватит, продолжить"),
+                )
+                return
+            await message.answer("✔ Все 4 кадра приняты.")
+        else:
+            clip = message.video_note or message.video
+            kind = "video_note" if message.video_note else "video"
+            await state.update_data(p_media=[[kind, "clip", clip.file_id]])
+            await message.answer("✔ Видео принял.")
+        await _after_measures(message, state, db)
+
+
+@router.callback_query(Ob.filter(F.act == "pdone"), Onb.photos)
+async def on_photos_done(cb: CallbackQuery, state: FSMContext, db: Database):
+    await cb.answer()
+    await cb.message.edit_reply_markup(reply_markup=None)
+    async with _media_lock:
+        await _after_measures(cb.message, state, db)
+
+
+@router.message(Onb.photos, F.text, ~F.text.startswith("/"))
+async def on_photos_text(message: Message):
+    await message.answer(
+        "Жду фото или кружок. Нет возможности сейчас — нажми «Пропустить».", reply_markup=_skip_kb()
+    )
 
 
 async def _ask_measure(message: Message, state: FSMContext):
@@ -150,7 +245,7 @@ async def _ask_measure(message: Message, state: FSMContext):
     )
 
 
-async def _save_measure(message: Message, state: FSMContext, value: float | None, db: Database, rem: Reminders):
+async def _save_measure(message: Message, state: FSMContext, value: float | None, db: Database):
     data = await state.get_data()
     idx = data["m_idx"]
     vals = dict(data["m_vals"])
@@ -161,26 +256,23 @@ async def _save_measure(message: Message, state: FSMContext, value: float | None
     if idx < len(MEASURES):
         await _ask_measure(message, state)
         return
-    if data["mode"] == "onb":
-        await _ask_goal(message, state)
-    else:
-        await _finish_measure_update(message, state, db)
+    await _after_measures(message, state, db)
 
 
 @router.message(Onb.measure)
-async def on_measure(message: Message, state: FSMContext, db: Database, reminders: Reminders):
+async def on_measure(message: Message, state: FSMContext, db: Database):
     n = _num(message.text or "")
     if n is None or not 10 <= n <= 200:
         await message.answer("Число в сантиметрах (10–200) или кнопка «Пропустить».")
         return
-    await _save_measure(message, state, n, db, reminders)
+    await _save_measure(message, state, n, db)
 
 
 @router.callback_query(Ob.filter(F.act == "mskip"), Onb.measure)
-async def on_measure_skip(cb: CallbackQuery, state: FSMContext, db: Database, reminders: Reminders):
+async def on_measure_skip(cb: CallbackQuery, state: FSMContext, db: Database):
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
-    await _save_measure(cb.message, state, None, db, reminders)
+    await _save_measure(cb.message, state, None, db)
 
 
 @router.message(Command("measure"))
@@ -203,6 +295,9 @@ async def _finish_measure_update(message: Message, state: FSMContext, db: Databa
     prev = await db.measurement_series(user["tg_id"])
     await db.add_measurements(user["tg_id"], values, today)
     await db.update_user(user["tg_id"], weight_kg=data["weight"])
+    media = data.get("p_media") or []
+    if media:
+        await db.add_progress_media(user["tg_id"], today, [tuple(m) for m in media])
     lines = []
     for kind, val in values.items():
         label = MEASURE_LABELS[kind]
@@ -215,7 +310,8 @@ async def _finish_measure_update(message: Message, state: FSMContext, db: Databa
         else:
             lines.append(f"{label}: {val:g} {unit}")
     await state.clear()
-    await message.answer("Записал:\n" + "\n".join(lines) + "\n\nИзменения замеров заметны через 4–8 недель. "
+    photos = "\nФото сохранил: /progress." if media else ""
+    await message.answer("Записал:\n" + "\n".join(lines) + photos + "\n\nИзменения заметны через 4–8 недель. "
                          "Не гоняйся за ними каждый день.", reply_markup=main_menu())
 
 
@@ -429,7 +525,10 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
         level=data["level"], place=data["place"], days_per_week=data["days_per_week"],
         days=",".join(map(str, days)), train_time=data["train_time"], tz=tz, rotation_idx=0, onboarded=1,
     )
-    await db.add_measurements(tg_id, {"weight": data["weight"], **data["m_vals"]}, local_today(tz).isoformat())
+    today = local_today(tz).isoformat()
+    await db.add_measurements(tg_id, {"weight": data["weight"], **data["m_vals"]}, today)
+    if data.get("p_media"):
+        await db.add_progress_media(tg_id, today, [tuple(m) for m in data["p_media"]])
     user = await db.get_user(tg_id)
     assert user
     rem.schedule_user(user)

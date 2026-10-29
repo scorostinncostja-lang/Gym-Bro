@@ -1,10 +1,13 @@
 """Жёсткие правила безопасности в коде, до обращения к ИИ.
 
 LLM нельзя доверять в вопросах про подростков, добавки и еду: ответ даёт
-код, а не модель.
+код, а не модель. Подросткам дозы только из справочника (supp_advice),
+стимуляторы, диеты и стероиды закрыты.
 """
 import re
 from dataclasses import dataclass
+
+from bot.services.supp_advice import dose_reply
 
 MINOR_AGE = 18
 
@@ -40,14 +43,6 @@ DRUGS_REPLY = (
     "Нужен результат — прогрессия нагрузки, еда, сон. Скажи, что хочешь улучшить, и я помогу в этих рамках."
 )
 
-MINOR_SUPP_REPLY = (
-    "Дозировки добавок я не даю тем, кому нет 18. Это не вредность: данных по подросткам мало, "
-    "а ошибка в дозе стоит дороже, чем эффект.\n\n"
-    "В твоём возрасте результат на 90% делают еда, сон и прогрессия нагрузок. "
-    "Если очень хочется добавку — разберись с родителями и врачом (педиатр или спортивный врач). "
-    "Посмотреть, что вообще работает, а что маркетинг: /supplements"
-)
-
 MINOR_STIM_REPLY = (
     "Жиросжигатели, предтрены, тестобустеры и энергетики подросткам нельзя. "
     "Это стимуляторы или бесполезные таблетки с риском для сердца, сна и гормонов. "
@@ -81,7 +76,7 @@ def check(text: str, age: int | None) -> GuardHit | None:
         if _STIMULANT.search(text):
             return GuardHit("minor_stimulant", MINOR_STIM_REPLY)
         if _DOSE_INTENT.search(text):
-            return GuardHit("minor_supp_dose", MINOR_SUPP_REPLY)
+            return GuardHit("minor_supp_dose", dose_reply(text))
         if _DIET.search(text):
             return GuardHit("minor_diet", MINOR_DIET_REPLY)
     return None

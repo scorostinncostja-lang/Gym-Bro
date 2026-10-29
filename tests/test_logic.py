@@ -120,6 +120,7 @@ def test_guard_blocks_drugs_for_everyone():
 
 @pytest.mark.parametrize("text,reason", [
     ("сколько креатина принимать в день?", "minor_supp_dose"),
+    ("как пить протеин и когда", "minor_supp_dose"),
     ("хочу жиросжигатель", "minor_stimulant"),
     ("как быстро похудеть, дефицит калорий?", "minor_diet"),
     ("хочу умереть", "red_flag"),
@@ -134,21 +135,52 @@ def test_guard_lets_normal_questions_and_adults_through():
     assert guard.check("а что с добавками?", None) is None
 
 
-def test_minor_supplement_card_has_no_dose():
+def test_minor_supplement_cards_give_only_teen_doses():
     for s in supplements().values():
         text = card_text(s, adult=False)
-        if len(s["dose"]) > 25:  # короткие «Не нужен» совпадают с текстом для подростка
-            assert s["dose"] not in text
-        assert "Дозировка" not in text and "Риски" not in text
+        assert "Дозировка" not in text  # взрослая строка подросткам не показывается
+        if s["teen"]["ok"]:
+            assert s["teen"]["dose"] in text and "Скажи родителям" in text
+        else:
+            assert "Тебе" in text and s["teen"]["note"] in text
+    # взрослая доза креатина (3–5 г) не просачивается в карточку подростка
+    assert supplements()["creatine"]["dose"] not in card_text(supplements()["creatine"], adult=False)
+
+
+def test_teen_whitelist_and_dangerous_never_allowed():
+    ok = {s["id"] for s in supplements().values() if s["teen"]["ok"]}
+    assert ok == {"creatine", "whey", "omega3", "vitd", "multivit"}
+    for sid in ("preworkout", "fatburner", "testobooster", "caffeine"):
+        assert not supplements()[sid]["teen"]["ok"]
+    for s in supplements().values():
+        assert not (s["verdict"] in ("dangerous", "useless") and s["teen"]["ok"])
+
+
+def test_dose_reply_uses_reference_and_handles_unknown():
+    from bot.services.supp_advice import dose_reply
+    assert "3 г в день" in dose_reply("сколько креатина")
+    assert "кофеин" in dose_reply("доза кофеина").lower()
+    assert "Спроси про конкретную" in dose_reply("какие добавки мне пить")
 
 
 def test_supplement_data_valid():
     for s in supplements().values():
         assert s["verdict"] in {"works", "conditional", "useless", "dangerous"}
         assert s["evidence"] in set("ABCD")
-        for k in ("summary", "who", "dose", "risks", "minor_note", "sources"):
+        for k in ("summary", "who", "dose", "risks", "sources"):
             assert s[k]
+        assert s["teen"]["note"]
+        if s["teen"]["ok"]:
+            assert s["teen"]["dose"] and s["teen"]["who"]
     assert supplements()["preworkout"]["verdict"] == "dangerous"
+
+
+def test_minor_system_prompt_carries_teen_reference():
+    from bot.prompts import system_prompt
+    minor = system_prompt({"age": 15})
+    adult = system_prompt({"age": 25})
+    assert "3 г в день" in minor and "не рекомендовать" in minor
+    assert "Справочник добавок для подростков" not in adult
 
 
 # ---------- время ----------

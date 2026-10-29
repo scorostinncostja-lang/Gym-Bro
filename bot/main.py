@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from bot.config import get_settings
 from bot.db.database import Database
-from bot.handlers import chat, info, onboarding, supplements, workout
+from bot.handlers import chat, info, onboarding, progress, supplements, workout
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
 from bot.services.reminders import Reminders
@@ -24,7 +24,9 @@ COMMANDS = [
     BotCommand(command="today", description="Тренировка сегодня"),
     BotCommand(command="plan", description="Моя программа"),
     BotCommand(command="stats", description="Прогресс и серия"),
-    BotCommand(command="measure", description="Новые замеры"),
+    BotCommand(command="measure", description="Новые замеры (лента, фото, кружок)"),
+    BotCommand(command="progress", description="Фото «было → стало»"),
+    BotCommand(command="photo_guide", description="Как снимать фото и кружок"),
     BotCommand(command="supplements", description="Добавки без рекламы"),
     BotCommand(command="exercise", description="Анимация и техника упражнения"),
     BotCommand(command="library", description="Каталог упражнений"),
@@ -74,7 +76,7 @@ def build_dispatcher(*, settings, db, edb, llm, workouts, reminders) -> Dispatch
     dp.callback_query.outer_middleware(access)
     dp.errors.register(on_error)
     # Порядок важен: ИИ-чат с «ловит всё» идёт последним.
-    for r in (onboarding.router, workout.router, info.router, supplements.router, chat.router):
+    for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router):
         dp.include_router(r)
     return dp
 

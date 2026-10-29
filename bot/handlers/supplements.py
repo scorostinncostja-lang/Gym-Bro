@@ -9,6 +9,7 @@ from bot.data import supplements
 from bot.db.database import Database
 from bot.services.guard import MINOR_AGE
 from bot.services.reminders import Reminders
+from bot.services.supp_advice import TEEN_FOOTER, can_stack, dose_for
 from bot.services.timeutil import parse_time
 from bot.ui import BTN_SUPP, Sup, inline
 
@@ -31,8 +32,9 @@ LEGEND = (
     "Я не врач, это справка, а не назначение."
 )
 MINOR_HEAD = (
-    "\nТебе нет 18, поэтому дозы и схемы приёма я не показываю. Сначала еда и сон; "
-    "если захочется добавку — обсуди с родителями и врачом."
+    "\n<b>Тебе до 18</b>: для безопасных добавок (креатин, протеин, омега-3, витамин D, мультивитамины) "
+    "даю малые дозы. Кофеин, предтренировочные, жиросжигатели, тестобустеры и диеты — нет. "
+    "Сначала еда и сон, добавка на десятом месте. Скажи родителям."
 )
 
 
@@ -56,19 +58,25 @@ def list_keyboard():
 
 
 def card_text(s: dict, adult: bool) -> str:
+    t = s["teen"]
+    who = s["who"] if adult or not t["ok"] else t["who"]
     lines = [
         f"<b>{html.escape(s['name'])}</b>",
         f"{VERDICTS[s['verdict']]} · доказательства: {s['evidence']}",
         "",
         html.escape(s["summary"]),
-        f"\n<b>Кому</b>: {html.escape(s['who'])}",
+        f"\n<b>Кому</b>: {html.escape(who)}",
     ]
     if adult:
         lines.append(f"<b>Дозировка</b>: {html.escape(s['dose'])}")
         lines.append(f"<b>Риски</b>: {html.escape(s['risks'])}")
+    elif t["ok"]:
+        lines.append(f"<b>Тебе (до 18)</b>: {html.escape(t['dose'])}")
+        lines.append(f"<b>Важно</b>: {html.escape(t['note'])}")
+        lines.append(f"<b>Риски</b>: {html.escape(s['risks'])}")
+        lines.append(f"<i>{TEEN_FOOTER}</i>")
     else:
-        lines.append(f"<b>Тебе</b>: {html.escape(s['minor_note'])}")
-        lines.append("<i>Дозировки для тех, кому нет 18, не даю.</i>")
+        lines.append(f"<b>Тебе</b>: {html.escape(t['note'])}")
     lines.append(f"\n<i>Источники: {html.escape(s['sources'])}</i>")
     return "\n".join(lines)
 
@@ -98,7 +106,7 @@ async def on_show(cb: CallbackQuery, callback_data: Sup, db: Database):
     user = await db.get_user(cb.from_user.id)
     adult = _is_adult(user)
     rows = []
-    if adult and s["verdict"] in ("works", "conditional"):
+    if can_stack(s, adult):
         in_stack = s["id"] in await db.stack_list(cb.from_user.id)
         rows.append([("➖ Убрать из набора" if in_stack else "➕ В мой набор",
                       Sup(act="rm" if in_stack else "add", id=s["id"]))])
@@ -109,8 +117,9 @@ async def on_show(cb: CallbackQuery, callback_data: Sup, db: Database):
 @router.callback_query(Sup.filter(F.act.in_({"add", "rm"})))
 async def on_stack_change(cb: CallbackQuery, callback_data: Sup, db: Database, reminders: Reminders):
     user = await db.get_user(cb.from_user.id)
-    if not _is_adult(user):
-        await cb.answer("Набор доступен с 18 лет.", show_alert=True)
+    s = supplements().get(callback_data.id)
+    if not user or not s or not can_stack(s, _is_adult(user)):
+        await cb.answer("Эту добавку в набор не добавляю.", show_alert=True)
         return
     if callback_data.act == "add":
         await db.stack_add(cb.from_user.id, callback_data.id)
@@ -124,17 +133,17 @@ async def on_stack_change(cb: CallbackQuery, callback_data: Sup, db: Database, r
 @router.message(Command("stack"))
 async def cmd_stack(message: Message, db: Database):
     user = await db.get_user(message.from_user.id)
-    if not _is_adult(user):
-        await message.answer("Личный набор и напоминания про добавки доступны с 18 лет. "
-                             "Сейчас: еда, сон, тренировки. Справка: /supplements")
+    if not user or not user["onboarded"]:
+        await message.answer("Сначала анкета: /start")
         return
-    stack = await db.stack_list(message.from_user.id)
+    adult = _is_adult(user)
     sup = supplements()
+    stack = [sid for sid in await db.stack_list(message.from_user.id) if sid in sup and can_stack(sup[sid], adult)]
     if not stack:
         await message.answer("Набор пуст. Открой /supplements и добавь нужное (кнопка «В мой набор»).")
         return
-    on = bool(user["supp_remind"])  # type: ignore[index]
-    lines = "\n".join(f"• {html.escape(sup[s]['name'])}: {html.escape(sup[s]['dose'])}" for s in stack if s in sup)
+    on = bool(user["supp_remind"])
+    lines = "\n".join(f"• {html.escape(sup[s]['name'])}: {html.escape(dose_for(sup[s], adult) or '')}" for s in stack)
     await message.answer(
         f"<b>Мой набор</b>\n{lines}\n\nНапоминание: {'вкл' if on else 'выкл'} в {user['supp_time']}. "  # type: ignore[index]
         "Время: <code>/supp_time 09:00</code>",
@@ -145,10 +154,10 @@ async def cmd_stack(message: Message, db: Database):
 @router.callback_query(Sup.filter(F.act == "remind"))
 async def on_remind_toggle(cb: CallbackQuery, db: Database, reminders: Reminders):
     user = await db.get_user(cb.from_user.id)
-    if not _is_adult(user):
-        await cb.answer("Только с 18 лет.", show_alert=True)
+    if not user or not user["onboarded"]:
+        await cb.answer("Сначала анкета: /start", show_alert=True)
         return
-    new = 0 if user["supp_remind"] else 1  # type: ignore[index]
+    new = 0 if user["supp_remind"] else 1
     await db.update_user(cb.from_user.id, supp_remind=new)
     reminders.schedule_user((await db.get_user(cb.from_user.id)))  # type: ignore[arg-type]
     await cb.answer("Включено" if new else "Выключено")
@@ -158,8 +167,8 @@ async def on_remind_toggle(cb: CallbackQuery, db: Database, reminders: Reminders
 @router.message(Command("supp_time"))
 async def cmd_supp_time(message: Message, command: CommandObject, db: Database, reminders: Reminders):
     user = await db.get_user(message.from_user.id)
-    if not _is_adult(user):
-        await message.answer("Напоминания про добавки доступны с 18 лет.")
+    if not user or not user["onboarded"]:
+        await message.answer("Сначала анкета: /start")
         return
     t = parse_time(command.args or "")
     if not t:

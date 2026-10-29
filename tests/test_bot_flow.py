@@ -5,11 +5,11 @@ import pytest
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import TelegramMethod
-from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, Update, User
+from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, PhotoSize, Update, User, VideoNote
 
 from bot.config import Settings
 from bot.db.database import Database
-from bot.handlers import chat, info, onboarding, supplements, workout
+from bot.handlers import chat, info, onboarding, progress, supplements, workout
 from bot.main import build_dispatcher
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
@@ -60,7 +60,7 @@ async def rig():
     reminders = Reminders(bot, db, workouts)
     settings = Settings(_env_file=None, bot_token="123456:TEST")
     # Роутеры модульные, а в тестах диспетчеров несколько: отцепляем от прошлого.
-    for r in (onboarding.router, workout.router, info.router, supplements.router, chat.router):
+    for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router):
         r._parent_router = None
     dp = build_dispatcher(settings=settings, db=db, edb=edb, llm=LLM(settings), workouts=workouts, reminders=reminders)
     yield bot, dp, db, session
@@ -78,6 +78,15 @@ class Chatter:
         self.mid += 1
         await self.dp.feed_update(self.bot, Update(update_id=self.uid, message=msg))
 
+    async def send(self, **fields):
+        self.uid += 1
+        msg = Message(message_id=self.mid, date=datetime.now(), chat=CHAT, from_user=USER, **fields)
+        self.mid += 1
+        await self.dp.feed_update(self.bot, Update(update_id=self.uid, message=msg))
+
+    async def photo(self, n: int):
+        await self.send(photo=[PhotoSize(file_id=f"ph{n}", file_unique_id=f"u{n}", width=90, height=160)])
+
     async def press(self, data):
         self.uid += 1
         msg = Message(message_id=self.mid, date=datetime.now(), chat=CHAT, from_user=User(id=999, is_bot=True, first_name="bot"), text="x")
@@ -85,10 +94,23 @@ class Chatter:
         await self.dp.feed_update(self.bot, Update(update_id=self.uid, callback_query=cb))
 
 
-async def onboard(c: Chatter, age="15"):
+async def onboard(c: Chatter, age="15", method="tape"):
     await c.say("/start")
-    for v in (age, "62", "175", "35", "90", "28", "25", "75", "50"):
+    for v in (age, "62", "175"):
         await c.say(v)
+    if method == "tape":
+        await c.press(Ob(act="mtape"))
+        for v in ("35", "90", "28", "25", "75", "50"):
+            await c.say(v)
+    elif method == "none":
+        await c.press(Ob(act="mnone"))
+    else:  # photo: дальше тест сам присылает фото или кружок
+        await c.press(Ob(act="mphoto"))
+        return
+    await finish_onboarding(c)
+
+
+async def finish_onboarding(c: Chatter):
     await c.press(Ob(act="goal", arg="muscle"))
     await c.press(Ob(act="level", arg="new"))
     await c.press(Ob(act="place", arg="gym"))
@@ -152,12 +174,86 @@ async def test_workout_session_via_telegram(rig):
     assert any("Тренировка завершена" in t for t in session.texts())
 
 
-async def test_minor_guard_blocks_dose_question_without_llm(rig):
+async def test_minor_gets_small_creatine_dose_without_llm(rig):
     bot, dp, db, session = rig
     c = Chatter(bot, dp)
     await onboard(c)
     await c.say("сколько креатина мне принимать?")
-    assert any("Дозировки добавок я не даю" in t for t in session.texts())
+    text = "\n".join(session.texts())
+    assert "3 г в день" in text and "Скажи родителям" in text
+    assert not any(n == "SendChatAction" for n, _ in session.sent)  # ИИ не вызывался
+
+
+async def test_minor_still_blocked_from_stimulants_and_diets(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await c.say("хочу предтрен и жиросжигатель")
+    await c.say("как сесть на диету и похудеть")
+    text = "\n".join(session.texts())
+    assert "подросткам нельзя" in text and "Диеты, сушку" in text
+
+
+async def test_minor_can_build_stack_and_get_reminder_text(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import Sup
+    await c.press(Sup(act="add", id="creatine"))
+    await c.press(Sup(act="add", id="preworkout"))  # опасное: не добавляется
+    assert await db.stack_list(1) == ["creatine"]
+    await c.say("/stack")
+    assert any("3 г в день" in t for t in session.texts())
+    await c.say("/supp_time 09:30")
+    assert (await db.get_user(1))["supp_time"] == "09:30"
+
+
+async def test_photo_instead_of_tape_in_onboarding(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c, method="photo")
+    assert any("Как снимать" in t for t in session.texts())
+    for n in range(1, 5):
+        await c.photo(n)
+    await finish_onboarding(c)
+    u = await db.get_user(1)
+    assert u["onboarded"] == 1
+    days = await db.progress_days(1)
+    media = await db.progress_media_on(1, days[0])
+    assert [m["label"] for m in media] == ["front", "side", "back", "flex"]
+    assert (await db.measurement_series(1)).keys() == {"weight"}  # ленты не было, вес записан
+
+
+async def test_video_note_replaces_four_photos_and_progress_shows_it(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c, method="photo")
+    await c.send(video_note=VideoNote(file_id="vn1", file_unique_id="vu1", length=240, duration=15))
+    await finish_onboarding(c)
+    media = await db.progress_media_on(1, (await db.progress_days(1))[0])
+    assert [(m["kind"], m["file_id"]) for m in media] == [("video_note", "vn1")]
+    await c.say("/progress")
+    assert any(n == "SendVideoNote" for n, _ in session.sent)
+
+
+async def test_photo_step_can_be_skipped_and_delete_removes_media(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c, method="photo")
+    await c.photo(1)
+    await c.press(Ob(act="pdone"))
+    await finish_onboarding(c)
+    assert len(await db.progress_media_on(1, (await db.progress_days(1))[0])) == 1
+    await db.delete_user(1)
+    assert await db.progress_days(1) == []
+
+
+async def test_onboarding_without_any_measurements(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c, method="none")
+    assert (await db.get_user(1))["onboarded"] == 1
+    assert await db.progress_days(1) == []
 
 
 async def test_supplements_screen_and_exercise_search(rig):

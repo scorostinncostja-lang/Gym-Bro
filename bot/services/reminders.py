@@ -11,6 +11,7 @@ from apscheduler.triggers.date import DateTrigger
 
 from bot.data import supplements
 from bot.db.database import Database
+from bot.services.supp_advice import can_stack
 from bot.services.timeutil import local_today, parse_days
 from bot.services.workout import WorkoutService
 from bot.ui import Rem, inline
@@ -19,7 +20,7 @@ log = logging.getLogger(__name__)
 
 FOLLOWUP_MIN = 45
 SNOOZE_MIN = 30
-ADULT = 18
+ADULT = 18  # от возраста зависят только дозы, а не само напоминание
 
 
 def reminder_keyboard(wid: int):
@@ -65,7 +66,7 @@ class Reminders:
                 args=[tg_id], id=f"wk:{tg_id}:cron", misfire_grace_time=600, coalesce=True,
                 replace_existing=True,
             )
-        if user.get("supp_remind") and (user.get("age") or 0) >= ADULT and user.get("tz"):
+        if user.get("supp_remind") and user.get("tz"):
             h, m = map(int, user["supp_time"].split(":"))
             self.scheduler.add_job(
                 self.send_supp_reminder, CronTrigger(hour=h, minute=m, timezone=ZoneInfo(user["tz"])),
@@ -128,13 +129,14 @@ class Reminders:
 
     async def send_supp_reminder(self, tg_id: int) -> None:
         user = await self.db.get_user(tg_id)
-        if not user or (user.get("age") or 0) < ADULT:
+        if not user:
             return
-        stack = await self.db.stack_list(tg_id)
+        adult = (user.get("age") or 0) >= ADULT
+        sup = supplements()
+        stack = [s for s in await self.db.stack_list(tg_id) if s in sup and can_stack(sup[s], adult)]
         if not stack:
             return
-        sup = supplements()
-        names = ", ".join(sup[s]["name"] for s in stack if s in sup)
+        names = ", ".join(sup[s]["name"] for s in stack)
         await self._safe_send(
             tg_id, f"💊 Твой набор на сегодня: {html.escape(names)}.\nДозы: /supplements → нужная добавка."
         )
