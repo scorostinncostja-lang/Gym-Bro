@@ -2,6 +2,8 @@
 
 Telegram-бот для новичка в зале: программа под твой инвентарь, напоминания, подсказки по весам, GIF-анимации упражнений, ИИ-тренер (Gemini + Groq), голос (Groq Whisper), честный справочник по добавкам.
 
+**Полная пошаговая инструкция (токен, ключи, сервер, обновление, бэкап, ошибки): [docs/SETUP.md](docs/SETUP.md).**
+
 ## Запуск за 3 минуты
 
 ```bash
@@ -14,7 +16,7 @@ uv run python -m bot
 - Ключи: [Gemini](https://aistudio.google.com/apikey), [Groq](https://console.groq.com/keys), оба на бесплатном тарифе.
 - Без ключей бот работает, кроме ИИ-чата, голоса и разбора фото.
 - Свой Telegram ID (`@userinfobot`) впиши в `ALLOWED_USER_IDS`, пока бот не для всех.
-- Модели меняются у провайдеров. Если ответа нет — проверь `GEMINI_MODEL` и `GROQ_*_MODEL` в `.env`.
+- Модель Gemini по умолчанию `gemini-3.8-flash`. Не отвечает Gemini — бот уходит на Groq. Имена моделей меняются у провайдеров: при проблемах проверь `GEMINI_MODEL` и `GROQ_*_MODEL` в `.env`.
 
 ## Что умеет
 
@@ -81,7 +83,7 @@ bot/
     exercise_db      клиент внешней базы
   db/database.py     SQLite
 data/                свои данные: exercises.json (подсказки на русском), programs.json, supplements.json
-tests/               55 тестов, включая сквозной прогон бота
+tests/               57 тестов, включая сквозной прогон бота
 ```
 
 Добавить упражнение: запись в `data/exercises.json` (паттерн, инвентарь, подсказки, `hasan` — id из базы). Новая программа: шаблоны в `data/programs.json`.

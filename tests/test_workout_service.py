@@ -96,3 +96,19 @@ async def test_quota_and_delete(env):
     await db.chat_add(1, "user", "hi")
     await db.delete_user(1)
     assert await db.get_user(1) is None and await db.chat_recent(1) == []
+
+
+async def test_stale_active_workout_is_closed(env):
+    from datetime import datetime, timedelta, timezone
+
+    db, svc = env
+    user = await db.get_user(1)
+    w = await svc.ensure_planned(user, date(2026, 1, 5))
+    old = (datetime.now(timezone.utc) - timedelta(hours=12)).isoformat(timespec="seconds")
+    w = await svc.start(w["id"], old)
+    assert await db.active_workout(1) is None  # забытая тренировка больше не перехватывает чат
+    assert (await db.get_workout(w["id"]))["status"] == "missed"
+
+    fresh = await svc.ensure_planned(user, date(2026, 1, 7))
+    await svc.start(fresh["id"], datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    assert (await db.active_workout(1))["id"] == fresh["id"]

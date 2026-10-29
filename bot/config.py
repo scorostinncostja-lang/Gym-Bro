@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     groq_api_key: str = ""
 
     # Имена моделей меняются у провайдеров часто, поэтому только через .env.
-    gemini_model: str = "gemini-flash-latest"
+    gemini_model: str = "gemini-3.8-flash"
     groq_llm_model: str = "llama-3.3-70b-versatile"
     groq_vision_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     groq_stt_model: str = "whisper-large-v3-turbo"

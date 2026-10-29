@@ -6,6 +6,8 @@ from typing import Any
 
 import aiosqlite
 
+STALE_WORKOUT_HOURS = 8
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     tg_id INTEGER PRIMARY KEY,
@@ -217,9 +219,29 @@ class Database:
         w = await self._one(
             "SELECT * FROM workouts WHERE tg_id=? AND status='active' ORDER BY id DESC LIMIT 1", (tg_id,)
         )
-        if w:
-            w["plan"] = json.loads(w["plan"])
+        if not w:
+            return None
+        if self._is_stale(w):
+            await self._close_stale(w)
+            return None
+        w["plan"] = json.loads(w["plan"])
         return w
+
+    @staticmethod
+    def _is_stale(w: dict) -> bool:
+        """Забытая тренировка: иначе она перехватывала бы любые числа в чате."""
+        try:
+            started = datetime.fromisoformat(w["started_at"])
+        except (TypeError, ValueError):
+            return False
+        return datetime.now(timezone.utc) - started > timedelta(hours=STALE_WORKOUT_HOURS)
+
+    async def _close_stale(self, w: dict) -> None:
+        if await self.workout_sets(w["id"]):
+            await self.update_workout(w["id"], status="done", finished_at=w["started_at"])
+            await self._exec("UPDATE users SET rotation_idx=rotation_idx+1 WHERE tg_id=?", (w["tg_id"],))
+        else:
+            await self.update_workout(w["id"], status="missed")
 
     async def workout_on(self, tg_id: int, day: str) -> dict | None:
         w = await self._one(

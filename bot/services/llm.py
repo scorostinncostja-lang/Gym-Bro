@@ -16,6 +16,7 @@ from bot.prompts import SET_EXTRACT_PROMPT
 log = logging.getLogger(__name__)
 
 TIMEOUT = 45
+GEMINI_THINKING_HEADROOM = 1024
 
 
 class LLMError(RuntimeError):
@@ -83,11 +84,15 @@ class LLM:
         if media:
             parts.insert(0, types.Part.from_bytes(data=media.data, mime_type=media.mime))
         contents.append(types.Content(role="user", parts=parts))
+        # У Gemini 3.x токены «размышления» входят в max_output_tokens: без запаса ответ обрезается
+        # или приходит пустым. Температуру не передаём: для 3.8 sampling-параметры устарели.
         resp = await self.gemini.aio.models.generate_content(
             model=self.s.gemini_model,
             contents=contents,
             config=types.GenerateContentConfig(
-                system_instruction=system, max_output_tokens=max_tokens, temperature=temperature
+                system_instruction=system,
+                max_output_tokens=max_tokens + GEMINI_THINKING_HEADROOM,
+                thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
             ),
         )
         text = (resp.text or "").strip()

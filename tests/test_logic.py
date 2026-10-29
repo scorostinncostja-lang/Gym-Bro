@@ -172,3 +172,25 @@ def test_data_files_are_valid_json():
     from bot.config import DATA_DIR
     for f in ("exercises.json", "programs.json", "supplements.json"):
         json.loads((DATA_DIR / f).read_text(encoding="utf-8"))
+
+
+async def test_gemini_call_has_thinking_headroom_and_no_temperature():
+    from types import SimpleNamespace
+
+    from bot.config import Settings
+    from bot.services.llm import GEMINI_THINKING_HEADROOM, LLM
+
+    seen = {}
+
+    async def fake_generate(**kw):
+        seen.update(kw)
+        return SimpleNamespace(text="ок")
+
+    llm = LLM(Settings(bot_token="x", gemini_api_key="k", groq_api_key=""))
+    llm.gemini = SimpleNamespace(aio=SimpleNamespace(models=SimpleNamespace(generate_content=fake_generate)))
+    assert await llm.chat("sys", [], "привет", max_tokens=100) == "ок"
+    cfg = seen["config"]
+    assert seen["model"] == "gemini-3.8-flash"
+    assert cfg.max_output_tokens == 100 + GEMINI_THINKING_HEADROOM
+    assert cfg.temperature is None
+    assert cfg.thinking_config.thinking_level.value == "LOW"
