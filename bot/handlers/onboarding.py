@@ -93,7 +93,7 @@ async def cmd_start(message: Message, state: FSMContext, db: Database):
     await state.set_state(Onb.age)
 
 
-@router.message(Onb.age)
+@router.message(Onb.age, ~F.text.startswith("/"))
 async def on_age(message: Message, state: FSMContext):
     n = _num(message.text or "")
     if n is None or not 5 <= n <= 90:
@@ -119,7 +119,7 @@ async def on_age(message: Message, state: FSMContext):
     await state.set_state(Onb.weight)
 
 
-@router.message(Onb.weight)
+@router.message(Onb.weight, ~F.text.startswith("/"))
 async def on_weight(message: Message, state: FSMContext):
     n = _num(message.text or "")
     if n is None or not 25 <= n <= 250:
@@ -134,7 +134,7 @@ async def on_weight(message: Message, state: FSMContext):
         await _start_measures(message, state)
 
 
-@router.message(Onb.height)
+@router.message(Onb.height, ~F.text.startswith("/"))
 async def on_height(message: Message, state: FSMContext):
     n = _num(message.text or "")
     if n is None or not 120 <= n <= 230:
@@ -268,7 +268,7 @@ async def _save_measure(message: Message, state: FSMContext, value: float | None
     await _after_measures(message, state, db)
 
 
-@router.message(Onb.measure)
+@router.message(Onb.measure, ~F.text.startswith("/"))
 async def on_measure(message: Message, state: FSMContext, db: Database):
     n = _num(message.text or "")
     if n is None or not 10 <= n <= 200:
@@ -459,7 +459,7 @@ async def on_place_toggle(cb: CallbackQuery, callback_data: Ob, state: FSMContex
 
 
 @router.callback_query(Ob.filter(F.act == "pldone"), Onb.place)
-async def on_places_done(cb: CallbackQuery, state: FSMContext, db: Database):
+async def on_places_done(cb: CallbackQuery, state: FSMContext, db: Database, workouts: WorkoutService):
     data = await state.get_data()
     places = [p for p in ORDER if p in set(data.get("places", []))]
     if not places:
@@ -475,6 +475,8 @@ async def on_places_done(cb: CallbackQuery, state: FSMContext, db: Database):
             await state.set_data({"mode": "gear", "gear": load_gear(user)})
             await _ask_gear(cb.message, state, standalone=True)
             return
+        if user:
+            await workouts.refresh_planned(user)
         await state.clear()
         await cb.message.answer("Сохранил. Новые тренировки уже под это. Смотри: /plan", reply_markup=main_menu())
         return
@@ -621,7 +623,10 @@ async def on_gear_done(cb: CallbackQuery, state: FSMContext, db: Database, worko
             reply_markup=main_menu(),
         )
         return
-    await cb.message.answer(f"Инвентарь:\n{render_gear(gear)}")
+    if gear["items"]:
+        await cb.message.answer(f"Инвентарь:\n{render_gear(gear)}")
+    else:
+        await cb.message.answer("Ничего не отмечено: дома будут упражнения с весом тела. Добавить инвентарь можно в настройках.")
     await _ask_days_n(cb.message, state)
 
 
@@ -637,7 +642,7 @@ async def settings_gear(cb: CallbackQuery, state: FSMContext, db: Database):
 async def settings_goal(cb: CallbackQuery, state: FSMContext, db: Database):
     await cb.answer()
     user = await db.get_user(cb.from_user.id)
-    await state.set_data({"mode": "goal", "age": (user or {}).get("age")})
+    await state.set_data({"mode": "goal", "age": (user or {}).get("age"), "goals": goals_svc.user_goals(user)})
     await _ask_goal(cb.message, state)
 
 
@@ -717,7 +722,7 @@ async def _after_time(message: Message, state: FSMContext, time_str: str, db: Da
     await _ask_extra(message, state, db)
 
 
-@router.message(Onb.time)
+@router.message(Onb.time, ~F.text.startswith("/"))
 async def on_time_text(message: Message, state: FSMContext, db: Database, reminders: Reminders):
     t = parse_time(message.text or "")
     if not t:
@@ -817,7 +822,7 @@ async def _after_loc(message: Message, state: FSMContext, loc: Location, db: Dat
     await _finalize(message, state, loc.tz, db, rem)
 
 
-@router.message(Onb.tz)
+@router.message(Onb.tz, ~F.text.startswith("/"))
 async def on_tz_text(message: Message, state: FSMContext, db: Database, reminders: Reminders):
     loc = parse_location(message.text or "")
     if not loc:

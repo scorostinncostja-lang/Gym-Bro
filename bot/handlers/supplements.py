@@ -24,7 +24,7 @@ from bot.services.reminders import Reminders
 from bot.services.supp_advice import TEEN_FOOTER
 from bot.services.supp_plan import build_plan, plan_facts, render_plan
 from bot.services.timeutil import parse_time
-from bot.textfmt import format_llm
+from bot.textfmt import format_llm, reply_long
 from bot.ui import BTN_SUPP, Sup, inline
 
 log = logging.getLogger(__name__)
@@ -148,12 +148,34 @@ async def send_plan(
             text += "\n\n🧠 <b>Комментарий тренера</b>\n" + format_llm(comment)
         except LLMError as e:
             log.warning("Комментарий к плану добавок без ИИ: %s", e)
+    jars = await _jar_lines(db, user, owned)
+    if jars:
+        text += "\n\n📦 <b>Твои банки</b>\n" + "\n".join(jars)
     kb = inline([
         [("✏️ Изменить набор", Sup(act="own")), ("🔔 Напоминания", Sup(act="remind"))],
+        [("📸 Проверить банку по фото", Sup(act="have"))],
     ]) if plan.lines else main_keyboard()
-    for i in range(0, len(text), 3800):
-        last = i + 3800 >= len(text)
-        await message.answer(text[i:i + 3800], reply_markup=kb if last else None)
+    await reply_long(message, text, kb)
+
+
+async def _jar_lines(db: Database, user: dict, owned: list[str]) -> list[str]:
+    """Доза в порциях конкретной банки, которую человек уже присылал на проверку."""
+    out = []
+    latest: dict[str, dict] = {}
+    for p in await db.products(user["tg_id"]):
+        latest[p["supp_id"]] = p
+    for sid in owned:
+        prod = latest.get(sid)
+        if not prod:
+            continue
+        v = evaluate(prod["data"], user)
+        name = prod["data"].get("product") or prod.get("brand") or supplements()[sid]["name"]
+        parts = [p for p in (v.dose, v.supply) if p]
+        if prod.get("price") and v.days_supply:
+            parts.append(f"≈ {prod['price'] / v.days_supply:,.0f} в день".replace(",", " "))
+        if parts:
+            out.append(f"• {html.escape(str(name))}: {html.escape(' '.join(parts))}")
+    return out
 
 
 @router.message(Command("supplements", "supp"))
@@ -351,17 +373,17 @@ async def on_analyze(cb: CallbackQuery, state: FSMContext, db: Database, llm: LL
     if not data.get("media"):
         await cb.message.answer("Фото пока нет. Пришли снимок банки или напиши состав текстом.")
         return
-    await _analyze(cb.message, cb.from_user.id, data["media"], None, state, db, llm, settings, data.get("pid"))
+    await analyze_label(cb.message, cb.from_user.id, data["media"], None, state, db, llm, settings, data.get("pid"))
 
 
 @router.message(SuppFlow.photos, F.text, ~F.text.startswith("/"))
 async def on_label_text(message: Message, state: FSMContext, db: Database, llm: LLM, settings: Settings):
     data = await state.get_data()
-    await _analyze(message, message.from_user.id, data.get("media", []), message.text, state, db, llm, settings,
+    await analyze_label(message, message.from_user.id, data.get("media", []), message.text, state, db, llm, settings,
                    data.get("pid"))
 
 
-async def _analyze(
+async def analyze_label(
     message: Message, uid: int, file_ids: list[str], text: str | None, state: FSMContext,
     db: Database, llm: LLM, settings: Settings, pid: int | None = None,
 ) -> None:
@@ -484,9 +506,7 @@ async def on_buy_tier(cb: CallbackQuery, callback_data: Sup):
 
 
 async def _send_recommendation(message: Message, user: dict, sid: str, tier: str) -> None:
-    text = recommend(user, sid, None if tier == "all" else tier)
-    for i in range(0, len(text), 3800):
-        await message.answer(text[i:i + 3800])
+    await reply_long(message, recommend(user, sid, None if tier == "all" else tier))
 
 
 @router.callback_query(Sup.filter(F.act == "b2"))

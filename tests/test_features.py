@@ -380,3 +380,76 @@ def test_big_photo_is_shrunk_for_groq():
     Image.new("RGB", (3000, 2000), "white").save(buf, "JPEG")
     small = shrink_image(buf.getvalue())
     assert max(Image.open(io.BytesIO(small)).size) == 1024
+
+
+# ---------- регрессии полного разбора ----------
+def test_split_message_keeps_lines_and_limit():
+    from bot.textfmt import split_message
+    text = "\n".join(f"<b>строка {i}</b> " + "х" * 50 for i in range(300))
+    parts = split_message(text, 1000)
+    assert all(len(p) <= 1000 for p in parts) and "\n".join(parts) == text
+    assert all(p.count("<b>") == p.count("</b>") for p in parts)
+    assert split_message("а" * 2500, 1000)[0] == "а" * 1000
+
+
+def test_home_with_empty_gear_is_bodyweight_but_old_profiles_keep_dumbbells():
+    new = {"place": "home_db", "level": "new", "goal": "muscle", "age": 15,
+           "equipment": equipment.dump_gear(equipment.empty_gear())}
+    old = {"place": "home_db", "level": "new", "goal": "muscle", "age": 15}
+    assert "dumbbell" not in equipment.tags(new, "home_db") and "dumbbell" in equipment.tags(old, "home_db")
+    for i in range(2):
+        assert all(exercises()[p.ex_id].equip in ("bodyweight", "run", "walk") for p in build_day(template_for(3, i), new))
+
+
+def test_street_gives_dips_on_bars_and_kettlebell_has_start_weight():
+    from bot.services.start_weights import start_weight
+    user = {"place": "street", "level": "new", "goal": "muscle", "age": 15}
+    ids = {p.ex_id for k in range(4) for p in build_day(template_for(4, k), user)}
+    assert "bar_dips_neg" in ids
+    assert start_weight("kb_goblet", 62, 15, "new", 2) == 10
+
+
+async def test_cardio_never_counts_as_lifted_weight_and_pending_set_is_kept():
+    from datetime import date
+
+    from bot.db.database import Database
+    from bot.services.exercise_db import ExerciseDB
+    from bot.services.set_parser import ParsedSet
+    from bot.services.workout import WorkoutService
+
+    db = Database(":memory:")
+    await db.connect()
+    svc = WorkoutService(db, ExerciseDB())
+    await db.ensure_user(1, "T")
+    await db.update_user(1, age=15, weight_kg=62, height_cm=170, goal="muscle", level="new", place="gym",
+                         days_per_week=3, days="0,2,4", train_time="18:00", tz="Europe/Moscow", onboarded=1)
+    plan = [{"ex_id": "leg_press", "sets": 1, "lo": 8, "hi": 12, "kind": "weight", "step": 5},
+            {"ex_id": "treadmill", "sets": 1, "lo": 15, "hi": 40, "kind": "cardio", "step": 1}]
+    wid = await db.create_workout(1, date(2026, 1, 5).isoformat(), "Тест", "gym", plan)
+    w = await svc.start(wid, "now")
+    await svc.log_set(w, ParsedSet(40, 10, Feel.OK))
+    w = await db.get_workout(wid)
+    await svc.log_set(w, ParsedSet(5, 30, None))     # 5 км за 30 минут, «как далось» не нажато
+    user = await db.get_user(1)
+    res = await svc.finish(user, wid, "now")
+    assert res["volume"] == 400                       # 40 × 10, кардио не считается
+    sets = await db.workout_sets(wid)
+    assert all(s["feel"] is not None for s in sets)   # висящий подход закрыт «нормально»
+    await db.close()
+
+
+def test_cooldown_grows_with_consecutive_failures_and_resets_on_success():
+    import asyncio as _a
+    import time as _t
+
+    from bot.config import Settings
+    from bot.services.llm import LLM
+    llm = LLM(Settings(_env_file=None, bot_token="x"))
+    t0 = _t.monotonic()
+    llm._fail("m", _a.TimeoutError(), t0)
+    first = llm.health("m").until - _t.monotonic()
+    llm._fail("m", _a.TimeoutError(), t0)
+    second = llm.health("m").until - _t.monotonic()
+    assert 290 < first <= 300 and 590 < second <= 600
+    llm._ok("m", t0)
+    assert llm.health("m").until == 0 and llm.health("m").streak == 0

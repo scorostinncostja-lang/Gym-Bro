@@ -162,9 +162,16 @@ class WorkoutService:
     async def skip_exercise(self, workout_id: int) -> str:
         return await self._next_exercise(workout_id)
 
+    async def _close_pending(self, w: dict) -> None:
+        """Подход записан, а «как далось» не нажато: считаем «нормально», иначе он выпадет из истории."""
+        if w.get("pend_set_id"):
+            await self.db.set_feel(w["pend_set_id"], int(Feel.OK))
+            await self.db.update_workout(w["id"], pend_set_id=None)
+
     async def _next_exercise(self, workout_id: int) -> str:
         w = await self.db.get_workout(workout_id)
         assert w
+        await self._close_pending(w)
         ex_i = w["ex_i"] + 1
         if ex_i >= len(w["plan"]):
             await self.db.update_workout(workout_id, ex_i=ex_i, set_i=0, pend_set_id=None)
@@ -195,12 +202,13 @@ class WorkoutService:
         """Завершает тренировку и возвращает краткую сводку."""
         w = await self.db.get_workout(workout_id)
         assert w
+        await self._close_pending(w)
         sets = await self.db.workout_sets(workout_id)
         await self.db.update_workout(workout_id, status="done" if sets else "skipped", finished_at=now_iso)
         if sets:
             if w["day_name"] not in ("Кардио", flex_template()["name"]):
                 await self.db.update_user(user["tg_id"], rotation_idx=user["rotation_idx"] + 1)
-        volume = sum(s["weight"] * s["reps"] for s in sets)
+        volume = sum(s["weight"] * s["reps"] for s in sets if (e := get_exercise(s["ex_id"])) and e.kind == "weight")
         exercises = {s["ex_id"] for s in sets}
         return {
             "sets": len(sets), "exercises": len(exercises), "volume": volume,

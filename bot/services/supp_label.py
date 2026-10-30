@@ -175,7 +175,8 @@ def evaluate(label: dict, user: dict, price: float | None = None) -> Verdict:
         if cr is None and pure_creatine and serving:
             cr = serving  # «100% моногидрат»: вся порция — креатин
             v.info.append(f"По названию «100% моногидрат» считаю, что в порции {serving:g} г креатина.")
-        target = float(re.search(r"[\d.,]+", plan_line.dose).group(0).replace(",", ".")) if plan_line and plan_line.dose else 3.0
+        m_dose = re.search(r"\d+(?:[.,]\d+)?", plan_line.dose) if plan_line and plan_line.dose else None
+        target = float(m_dose.group(0).replace(",", ".")) if m_dose else 3.0
         if cr and cr > 0:
             daily_servings = target / cr
             dose_text = f"Твоя доза {target:g} г = {daily_servings:.2g} порции ({cr:g} г креатина в порции)."

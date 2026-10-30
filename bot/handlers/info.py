@@ -23,11 +23,12 @@ from bot.services.equipment import item_label, load_gear
 from bot.services.goals import goals_label, user_goals
 from bot.services.location import COUNTRY_NAME
 from bot.services.places import places_label, user_places
-from bot.services.program_builder import build_day
+from bot.services.program_builder import build_day, build_extra_day
 from bot.services.reminders import Reminders
 from bot.services.timeutil import WEEKDAYS_RU, fmt_days, local_today, next_training, parse_days
 from bot.services.workout import describe_item
 from bot.sources import ATTRIBUTION
+from bot.textfmt import reply_long
 from bot.ui import BTN_PLAN, BTN_SETTINGS, BTN_STATS, Ex, St, inline
 
 router = Router()
@@ -57,7 +58,11 @@ HELP = """\
 <b>Можно просто написать</b>
 • «напоминай в 19:30» или «тренируюсь по пн, ср, пт» — поменяю расписание
 • «у меня есть креатин и протеин» — посчитаю план приёма по твоему весу
-• любой вопрос по технике, питанию и восстановлению; фото еды и видео техники тоже принимаю
+• любой вопрос по технике, питанию и восстановлению
+• фото еды, техники или банки добавки и видео техники: спрошу, что на фото
+
+Голосовые работают везде, где можно писать текстом: подходы, вопросы, настройки.
+Запутался в настройке — нажми любую команду, она отменит незаконченный шаг.
 
 """ + ATTRIBUTION + "."
 
@@ -149,12 +154,20 @@ async def cmd_plan(message: Message, db: Database):
     for tpl in program_templates(user["days_per_week"]):
         items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in build_day(tpl, user))
         blocks.append(f"<b>{html.escape(tpl['name'])}</b>\n{items}")
-    nxt = next_training(days, user["train_time"], user["tz"])
+    extra = parse_days(user.get("cardio_days"))
+    if extra:
+        name, items = build_extra_day(user)
+        lines = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in items)
+        blocks.append(f"<b>{html.escape(name)}</b> ({fmt_days(extra)})\n{lines}")
+    nxt = next_training(sorted({*days, *extra}), user["train_time"], user["tz"])
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
-    await message.answer(
+    await reply_long(
+        message,
+        f"🎯 {goals_label(user_goals(user))}\n"
         f"{places_label(user_places(user))} · {fmt_days(days)} в {user['train_time']}\n"
         f"Ближайшая тренировка: {when}\n\n" + "\n\n".join(blocks)
-        + "\n\nДни чередуются по кругу. Веса подбираются автоматически по твоим результатам."
+        + "\n\nСиловые дни чередуются по кругу. Перед каждой тренировкой разминка, после неё растяжка. "
+        "Веса подбираются автоматически по твоим результатам.",
     )
 
 
@@ -194,7 +207,7 @@ async def cmd_stats(message: Message, db: Database):
     best = await db.best_lifts(tg)
     if best:
         rows = []
-        for b in best[:6]:
+        for b in [b for b in best if (e := get_exercise(b["ex_id"])) and e.kind == "weight"][:6]:
             ex = get_exercise(b["ex_id"])
             if ex:
                 rows.append(f"• {html.escape(ex.name)}: {b['best_w']:g} кг ({b['sessions']} трен.)")

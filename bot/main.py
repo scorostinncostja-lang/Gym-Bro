@@ -12,12 +12,13 @@ from pydantic import ValidationError
 
 from bot.config import get_settings
 from bot.db.database import Database
-from bot.middlewares import DoubleTapMiddleware, UserSerialMiddleware
-from bot.handlers import chat, info, onboarding, progress, supplements, workout
+from bot.middlewares import DoubleTapMiddleware, StateEscapeMiddleware, UserSerialMiddleware
+from bot.handlers import chat, fallback, info, onboarding, progress, supplements, workout
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
 from bot.services.reminders import Reminders
 from bot.services.workout import WorkoutService
+from bot.ui import MENU_BUTTONS
 
 log = logging.getLogger("gymbro")
 
@@ -82,9 +83,11 @@ def build_dispatcher(*, settings, db, edb, llm, workouts, reminders) -> Dispatch
     dp.message.outer_middleware(serial)
     dp.callback_query.outer_middleware(serial)
     dp.callback_query.outer_middleware(DoubleTapMiddleware())
+    dp.message.outer_middleware(StateEscapeMiddleware(MENU_BUTTONS))  # до фильтров состояний
     dp.errors.register(on_error)
     # Порядок важен: ИИ-чат с «ловит всё» идёт последним.
-    for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router):
+    for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router,
+              fallback.router):
         dp.include_router(r)
     return dp
 

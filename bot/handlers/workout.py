@@ -258,12 +258,15 @@ class ActiveWorkout(BaseFilter):
 # ---------- /today ----------
 @router.message(Command("today", "workout"))
 @router.message(F.text == BTN_TODAY)
-async def cmd_today(message: Message, db: Database, workouts: WorkoutService):
+async def cmd_today(message: Message, db: Database, workouts: WorkoutService, llm: LLM, settings: Settings):
     user = await db.get_user(message.from_user.id)
     if not user or not user["onboarded"]:
         await message.answer("Сначала анкета: /start")
         return
     active = await db.active_workout(user["tg_id"])
+    if active and active["ex_i"] >= len(active["plan"]):  # все упражнения сделаны, но не закрыта
+        await finish_workout(message, active, db, workouts, llm, settings)
+        return
     if active:
         await message.answer("Продолжаем текущую тренировку.")
         await show_exercise(message, active, workouts, with_media=False)
@@ -431,6 +434,9 @@ async def process_set_text(
     message: Message, w: dict, text: str, db: Database, workouts: WorkoutService, llm: LLM, settings: Settings,
 ) -> bool:
     """Пытается принять текст как подход или самочувствие. False = это не про тренировку (пусть отвечает чат)."""
+    if w["ex_i"] >= len(w["plan"]):
+        await finish_workout(message, w, db, workouts, llm, settings)
+        return True
     item = w["plan"][w["ex_i"]]
     has_digits = any(c.isdigit() for c in text)
     if workouts.reminders:

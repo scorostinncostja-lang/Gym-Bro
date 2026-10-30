@@ -4,25 +4,23 @@ import io
 import logging
 import time
 
-from aiogram import Bot, F, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, Update
 
 from bot.config import Settings
 from bot.db.database import Database
 from bot.handlers.onboarding import PRESET_DAYS
-from bot.handlers.supplements import send_plan
-from bot.handlers.workout import process_set_text
+from bot.handlers.supplements import analyze_label, send_plan
 from bot.prompts import FOOD_PROMPT, TECHNIQUE_PROMPT, system_prompt
 from bot.services import guard
 from bot.services.intents import ScheduleChange, parse_schedule_change, parse_supp_intent
 from bot.services.llm import LLM, LLMError, Media
 from bot.services.profile import build_profile
 from bot.services.reminders import Reminders
-from bot.services.timeutil import WEEKDAYS_RU, fmt_days, next_training, parse_days
+from bot.services.timeutil import WEEKDAYS_RU, fmt_days, next_training, parse_days, pick_extra_days
 from bot.textfmt import format_llm, reply_long
-from bot.services.workout import WorkoutService
 from bot.ui import MENU_BUTTONS, Ph, inline
 
 log = logging.getLogger(__name__)
@@ -53,6 +51,9 @@ async def apply_schedule(message: Message, user: dict, change: ScheduleChange, d
                 return
         else:
             fields.update(days=",".join(map(str, days)), days_per_week=len(days), rotation_idx=0)
+            old_extra = parse_days(user.get("cardio_days"))
+            if old_extra:  # дни кардио не должны совпасть с новыми силовыми
+                fields["cardio_days"] = ",".join(map(str, pick_extra_days(days, len(old_extra))))
     await db.update_user(user["tg_id"], **fields)
     fresh = await db.get_user(user["tg_id"])
     assert fresh
@@ -112,7 +113,10 @@ async def ask_ai(
         answer = await llm.chat(system, history, text)
     except LLMError as e:
         log.warning("LLM недоступен: %s", e)
-        await message.answer("ИИ сейчас недоступен, попробуй через минуту.")
+        await message.answer(
+            "Модели ИИ сейчас не отвечают: скорее всего, кончились бесплатные квоты. Проверить: /ai. "
+            "Тренировки, план и напоминания работают без ИИ."
+        )
         return
     await db.chat_add(message.from_user.id, "user", text)
     await db.chat_add(message.from_user.id, "model", answer)
@@ -127,11 +131,8 @@ async def on_text(message: Message, db: Database, llm: LLM, settings: Settings, 
 
 # ---------- голос ----------
 @router.message(F.voice)
-async def on_voice(message: Message, bot: Bot, state: FSMContext, db: Database, llm: LLM,
-                   settings: Settings, workouts: WorkoutService, reminders: Reminders):
-    if await state.get_state():
-        await message.answer("Сейчас идёт анкета: ответь, пожалуйста, текстом.")
-        return
+async def on_voice(message: Message, bot: Bot, db: Database, llm: LLM, settings: Settings, dispatcher: Dispatcher):
+    """Голос = тот же текст: расшифровываем и пропускаем через все сценарии (подход, настройка, вопрос)."""
     if not llm.groq:
         await message.answer("Голос не подключён: нет GROQ_API_KEY.")
         return
@@ -153,10 +154,9 @@ async def on_voice(message: Message, bot: Bot, state: FSMContext, db: Database, 
         await message.answer("Ничего не расслышал. Повтори, пожалуйста.")
         return
     await message.answer(f"🎙 {html.escape(text)}")
-    w = await db.active_workout(message.from_user.id)
-    if w and await process_set_text(message, w, text, db, workouts, llm, settings):
-        return
-    await ask_ai(message, text, db, llm, settings, reminders)
+    as_text = message.model_copy(update={"text": text, "voice": None})
+    # _voice: очередь пользователя уже занята этим голосовым, второй раз её не ждём
+    await dispatcher.feed_update(bot, Update(update_id=0, message=as_text), _voice=True)
 
 
 # ---------- фото ----------
@@ -167,7 +167,7 @@ def _gc() -> None:
 
 
 @router.message(F.photo)
-async def on_photo(message: Message, db: Database, llm: LLM, settings: Settings):
+async def on_photo(message: Message, state: FSMContext, db: Database, llm: LLM, settings: Settings):
     user = await db.get_user(message.from_user.id)
     if not user or not user["onboarded"]:
         await message.answer("Сначала анкета: /start")
@@ -180,14 +180,23 @@ async def on_photo(message: Message, db: Database, llm: LLM, settings: Settings)
     _pending[key] = (message.photo[-1].file_id, time.time())
     caption = (message.caption or "").lower()
     kind = "food" if any(w in caption for w in ("еда", "поел", "обед", "ужин", "завтрак")) else (
-        "tech" if any(w in caption for w in ("техник", "форма", "упражн")) else None)
+        "tech" if any(w in caption for w in ("техник", "форма", "упражн")) else (
+            "supp" if any(w in caption for w in ("добавк", "банк", "креатин", "протеин", "витамин", "омега", "состав"))
+            else None))
+    key = str(message.message_id)
+    if kind == "supp":
+        _pending.pop(f"{message.chat.id}:{key}", None)
+        await analyze_label(message, message.from_user.id, [message.photo[-1].file_id], None, state, db, llm, settings)
+        return
     if kind:
-        await analyze_photo(message, message.from_user.id, kind, str(message.message_id), db, llm, settings)
+        await analyze_photo(message, message.from_user.id, kind, key, db, llm, settings)
         return
     await message.reply(
         "Что на фото?",
-        reply_markup=inline([[("🍽 Еда", Ph(kind="food", key=str(message.message_id))),
-                              ("🏋️ Техника упражнения", Ph(kind="tech", key=str(message.message_id)))]]),
+        reply_markup=inline([
+            [("🍽 Еда", Ph(kind="food", key=key)), ("🏋️ Техника", Ph(kind="tech", key=key))],
+            [("💊 Банка добавки: проверить", Ph(kind="supp", key=key))],
+        ]),
     )
 
 
@@ -218,9 +227,17 @@ async def analyze_photo(message: Message, user_id: int, kind: str, mid: str, db:
 
 
 @router.callback_query(Ph.filter())
-async def on_photo_kind(cb: CallbackQuery, callback_data: Ph, db: Database, llm: LLM, settings: Settings):
+async def on_photo_kind(cb: CallbackQuery, callback_data: Ph, state: FSMContext, db: Database, llm: LLM,
+                        settings: Settings):
     await cb.answer()
     await cb.message.edit_reply_markup(reply_markup=None)
+    if callback_data.kind == "supp":
+        entry = _pending.pop(f"{cb.message.chat.id}:{callback_data.key}", None)
+        if not entry:
+            await cb.message.answer("Фото устарело. Пришли заново.")
+            return
+        await analyze_label(cb.message, cb.from_user.id, [entry[0]], None, state, db, llm, settings)
+        return
     await analyze_photo(cb.message, cb.from_user.id, callback_data.kind, callback_data.key, db, llm, settings)
 
 

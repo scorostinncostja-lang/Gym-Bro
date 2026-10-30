@@ -138,7 +138,7 @@ def tags(user: dict, place: str) -> set[str]:
     """Теги инвентаря, доступные в этом месте."""
     base = set(EQUIPMENT_BY_PLACE[place])
     gear = load_gear(user)
-    if place == "home_db" and gear["items"]:
+    if place == "home_db" and (gear["items"] or user.get("equipment") is not None):
         base = {"bodyweight", "run", "walk"}  # указан реальный инвентарь: вместо «гантели по умолчанию»
         base |= {_CATALOG[i["id"]]["tag"] for i in gear["items"] if i["id"] in _CATALOG}
         if "barbell" in base:

@@ -10,11 +10,16 @@ def _fmt_w(x: float) -> str:
     return str(int(x)) if float(x).is_integer() else f"{x:g}"
 
 
-def _fmt_sets(sets: list[dict]) -> str:
+def _fmt_sets(sets: list[dict], kind: str = "weight") -> str:
     out = []
     for s in sets:
         feel = _FEEL_WORD.get(Feel(s["feel"]), "") if s.get("feel") else ""
-        base = f"{_fmt_w(s['weight'])}×{s['reps']}" if s["weight"] else f"{s['reps']}"
+        if kind == "cardio":
+            base = f"{s['reps']} мин" + (f", {_fmt_w(s['weight'])} км" if s["weight"] else "")
+        elif kind == "time":
+            base = f"{s['reps']} сек"
+        else:
+            base = f"{_fmt_w(s['weight'])}×{s['reps']}" if s["weight"] else f"{s['reps']}"
         out.append(f"{base} ({feel})" if feel else base)
     return ", ".join(out)
 
@@ -30,10 +35,11 @@ async def workout_facts(db: Database, w: dict) -> tuple[str, dict]:
     for ex_id, ss in by_ex.items():
         ex = get_exercise(ex_id)
         prev = await db.last_sets(w["tg_id"], ex_id, exclude_workout=w["id"])
-        lines.append(f"- {ex.name if ex else ex_id}: сейчас {_fmt_sets(ss)}; раньше {_fmt_sets(prev) or 'впервые'}")
+        kind = ex.kind if ex else "weight"
+        lines.append(f"- {ex.name if ex else ex_id}: сейчас {_fmt_sets(ss, kind)}; раньше {_fmt_sets(prev, kind) or 'впервые'}")
         stats["easy"] += sum(1 for s in ss if s.get("feel") == Feel.EASY)
         stats["max"] += sum(1 for s in ss if s.get("feel") == Feel.MAX)
-        if prev and max(s["weight"] for s in ss) > max(s["weight"] for s in prev):
+        if kind == "weight" and prev and max(s["weight"] for s in ss) > max(s["weight"] for s in prev):
             stats["progress"] += 1
     return "\n".join(lines), stats
 

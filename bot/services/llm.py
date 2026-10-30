@@ -29,7 +29,8 @@ GEMINI_TIMEOUT_TEXT = 12
 GEMINI_TIMEOUT_MEDIA = 25  # фото и видео читаются дольше
 GEMINI_THINKING_HEADROOM = 1024
 GROQ_THINKING_HEADROOM = 1024
-GROQ_IMAGE_SIDE = 1024  # больше — бесплатный Groq отвечает «Request too large»
+GROQ_IMAGE_SIDE = 1024
+MAX_COOLDOWN = 6 * 3600  # больше — бесплатный Groq отвечает «Request too large»
 
 
 class LLMError(RuntimeError):
@@ -102,6 +103,7 @@ class Health:
     until: float = 0.0  # monotonic: до этого момента модель не трогаем
     calls: int = 0
     fails: int = 0
+    streak: int = 0  # сбоев подряд: каждый следующий удваивает паузу
 
 
 @dataclass
@@ -132,11 +134,13 @@ class LLM:
     def _ok(self, name: str, started: float) -> None:
         h = self.health(name)
         h.ok, h.ms, h.err, h.until, h.calls = True, int((time.monotonic() - started) * 1000), "", 0.0, h.calls + 1
+        h.streak = 0
 
     def _fail(self, name: str, e: BaseException, started: float) -> None:
         h = self.health(name)
         h.ok, h.ms, h.err = False, int((time.monotonic() - started) * 1000), short_error(e)
-        h.until = time.monotonic() + cooldown_for(e)
+        h.streak += 1
+        h.until = time.monotonic() + min(MAX_COOLDOWN, cooldown_for(e) * 2 ** (h.streak - 1))
         h.calls += 1
         h.fails += 1
 

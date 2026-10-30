@@ -394,7 +394,7 @@ class Database:
         """Максимальный рабочий вес по каждому упражнению с весом."""
         return await self._all(
             "SELECT ex_id, MAX(weight) AS best_w, COUNT(DISTINCT workout_id) AS sessions "
-            "FROM sets WHERE tg_id=? AND weight>0 AND feel IS NOT NULL GROUP BY ex_id ORDER BY sessions DESC",
+            "FROM sets WHERE tg_id=? AND weight>0 AND feel IS NOT NULL GROUP BY ex_id ORDER BY sessions DESC",  # кардио отсекается в обработчике
             (tg_id,),
         )
 

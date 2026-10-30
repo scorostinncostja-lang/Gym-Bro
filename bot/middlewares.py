@@ -21,7 +21,7 @@ class UserSerialMiddleware(BaseMiddleware):
 
     async def __call__(self, handler, event, data):
         user = data.get("event_from_user")
-        if user is None:
+        if user is None or data.get("_voice"):  # расшифровка голосового идёт внутри уже занятой очереди
             return await handler(event, data)
         if len(self._locks) > 2000:  # не копим замки бесконечно
             self._locks = {k: v for k, v in self._locks.items() if v.locked()}
@@ -51,3 +51,26 @@ class DoubleTapMiddleware(BaseMiddleware):
             return await handler(event, data)
         finally:
             self._done[key] = time.monotonic()
+
+
+class StateEscapeMiddleware(BaseMiddleware):
+    """Команда или кнопка меню посреди настройки отменяет её.
+
+    Иначе человек, который начал менять время и передумал, застревает: его «/today» или «40 10»
+    принимаются за ответ на вопрос настройки. Во время первой анкеты состояние не трогаем:
+    после /help можно спокойно продолжить отвечать.
+    """
+
+    def __init__(self, menu_buttons: set[str]) -> None:
+        self.menu = menu_buttons
+
+    async def __call__(self, handler, event, data):
+        text = getattr(event, "text", None) or ""
+        state = data.get("state")
+        if state is not None and (text.startswith("/") and not text.startswith("/start") or text in self.menu):
+            if await state.get_state() is not None:
+                db = data.get("db")
+                user = await db.get_user(event.from_user.id) if db and event.from_user else None
+                if user and user.get("onboarded"):
+                    await state.clear()
+        return await handler(event, data)

@@ -10,7 +10,7 @@ from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, PhotoSize
 
 from bot.config import Settings
 from bot.db.database import Database
-from bot.handlers import chat, info, onboarding, progress, supplements, workout
+from bot.handlers import chat, fallback, info, onboarding, progress, supplements, workout
 from bot.main import build_dispatcher
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
@@ -61,7 +61,8 @@ async def rig():
     reminders = Reminders(bot, db, workouts)
     settings = Settings(_env_file=None, bot_token="123456:TEST")
     # Роутеры модульные, а в тестах диспетчеров несколько: отцепляем от прошлого.
-    for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router):
+    for r in (onboarding.router, workout.router, info.router, supplements.router, progress.router, chat.router,
+              fallback.router):
         r._parent_router = None
     dp = build_dispatcher(settings=settings, db=db, edb=edb, llm=LLM(settings), workouts=workouts, reminders=reminders)
     yield bot, dp, db, session
@@ -698,3 +699,112 @@ async def test_extra_photos_update_same_product(rig):
     assert len(products) == 1 and products[0]["data"]["per_serving"]["protein_g"] == 24
     assert products[0]["data"]["brand"] == "Optimum Nutrition"
     assert any("🟢" in t for t in session.texts())
+
+
+# ---------- регрессии полного разбора ----------
+async def test_command_cancels_half_done_settings(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import St
+    await c.press(St(act="sched"))          # начал менять расписание
+    await c.say("/today")                    # передумал
+    assert any("Всё тело" in t for t in session.texts())
+    await c.say("07:00")                     # это уже не ответ на вопрос «во сколько»
+    assert (await db.get_user(1))["train_time"] == "18:00"
+
+
+async def test_help_during_first_questionnaire_keeps_progress(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await c.say("/start")
+    await c.say("15")
+    await c.say("/help")
+    assert any("Что я умею" in t for t in session.texts())
+    await c.say("62")
+    assert any("Рост в см" in t for t in session.texts())
+
+
+async def test_stale_button_and_sticker_get_an_answer(rig):
+    from aiogram.types import Sticker
+
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await c.press(Ob(act="gl", arg="muscle"))  # кнопка из анкеты, которая уже закончилась
+    answers = [d for n, d in session.sent if n == "AnswerCallbackQuery"]
+    assert answers and "устарела" in (answers[-1].get("text") or "")
+    await c.send(sticker=Sticker(file_id="s", file_unique_id="s", type="regular", width=1, height=1,
+                                 is_animated=False, is_video=False))
+    assert any("Такое я не понимаю" in t for t in session.texts())
+
+
+async def test_supplement_photo_from_chat_and_jar_in_plan(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    dp.workflow_data["llm"] = StubLLM(json.dumps({
+        "readable": True, "kind": "creatine", "brand": "Maxler", "product": "Creatine 100% Monohydrate",
+        "serving_g": 5, "servings": 60, "net_g": 300, "per_serving": {}, "certs": ["GMP"],
+        "expiry_visible": True, "importer_visible": True}))
+    dp.workflow_data["bot"] = bot
+    from aiogram.types import PhotoSize
+
+    class _DL:  # скачивание файла в тесте не нужно: модель-заглушка фото не смотрит
+        async def __call__(self, *a, **k):
+            return None
+    bot.download = _DL()
+    await c.send(photo=[PhotoSize(file_id="jar", file_unique_id="j", width=90, height=160)], caption="мой креатин")
+    assert any("Creatine 100% Monohydrate" in t and "GMP" in t for t in session.texts())
+    await c.say("/stack")
+    plan = "\n".join(session.texts())
+    assert "Твои банки" in plan and "0.6" in plan
+
+
+async def test_chat_schedule_change_moves_cardio_days(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    await db.update_user(1, cardio_days="1,3")
+    await c.say("тренируюсь по вторникам, четвергам и субботам")
+    u = await db.get_user(1)
+    assert u["days"] == "1,3,5"
+    assert not set(u["cardio_days"].split(",")) & {"1", "3", "5"} and len(u["cardio_days"].split(",")) == 2
+
+
+class VoiceLLM(StubLLM):
+    groq = object()
+
+    def __init__(self, heard: str):
+        super().__init__("ок")
+        self.heard = heard
+
+    async def transcribe(self, audio, filename="voice.ogg"):
+        return self.heard
+
+
+async def _voice(c, bot, dp, heard: str):
+    from aiogram.types import Voice
+
+    dp.workflow_data["llm"] = VoiceLLM(heard)
+
+    async def _dl(*a, **k):
+        return None
+    bot.download = _dl
+    await c.send(voice=Voice(file_id="v", file_unique_id="v", duration=3))
+
+
+async def test_voice_answers_settings_question_and_logs_sets(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import St
+    await c.press(St(act="goal"))
+    await c.press(Ob(act="goal_text"))
+    await _voice(c, bot, dp, "хочу силу и выносливость")
+    assert (await db.get_user(1))["goals"] == "strength,endurance"
+    w = await _start_workout(c, db)
+    await _voice(c, bot, dp, "сорок на десять нормально")   # словами: модель-заглушка не поймёт, а «40 10» — да
+    await _voice(c, bot, dp, "40 10 нормально")
+    assert len(await db.workout_sets(w["id"])) == 1
+    assert any("🎙 40 10 нормально" in t for t in session.texts())
