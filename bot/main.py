@@ -7,13 +7,24 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramUnauthorizedError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand, CallbackQuery, ErrorEvent, Message
-
 from pydantic import ValidationError
 
 from bot.config import get_settings
 from bot.db.database import Database
-from bot.middlewares import DoubleTapMiddleware, StateEscapeMiddleware, UserSerialMiddleware
-from bot.handlers import chat, fallback, info, onboarding, progress, supplements, workout
+from bot.handlers import (
+    chat,
+    fallback,
+    info,
+    onboarding,
+    progress,
+    supplements,
+    workout,
+)
+from bot.middlewares import (
+    DoubleTapMiddleware,
+    StateEscapeMiddleware,
+    UserSerialMiddleware,
+)
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
 from bot.services.reminders import Reminders
@@ -65,7 +76,7 @@ async def on_error(event: ErrorEvent) -> bool:
     if target:
         try:
             await target.answer("Что-то пошло не так. Я записал ошибку, попробуй ещё раз.")
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return True
 

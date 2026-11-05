@@ -87,7 +87,7 @@ async def weekly_text(db: Database, user: dict, llm=None, settings=None) -> str:
         from bot.services.profile import build_profile
 
         comment = await llm.chat(system_prompt(await build_profile(db, user), WEEK_PROMPT), [], facts, max_tokens=300)
-    except Exception as e:  # noqa: BLE001 — отчёт без комментария лучше, чем никакого
+    except Exception as e:
         log.warning("Недельный отчёт без ИИ: %r", e)
         return text
     return text + "\n\n🧠 <b>Тренер</b>\n" + format_llm(comment)

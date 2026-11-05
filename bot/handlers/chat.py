@@ -15,11 +15,21 @@ from bot.handlers.onboarding import PRESET_DAYS
 from bot.handlers.supplements import analyze_label, send_plan
 from bot.prompts import FOOD_PROMPT, TECHNIQUE_PROMPT, system_prompt
 from bot.services import guard
-from bot.services.intents import ScheduleChange, parse_schedule_change, parse_supp_intent
+from bot.services.intents import (
+    ScheduleChange,
+    parse_schedule_change,
+    parse_supp_intent,
+)
 from bot.services.llm import LLM, LLMError, Media
 from bot.services.profile import build_profile
 from bot.services.reminders import Reminders
-from bot.services.timeutil import WEEKDAYS_RU, fmt_days, next_training, parse_days, pick_extra_days
+from bot.services.timeutil import (
+    WEEKDAYS_RU,
+    fmt_days,
+    next_training,
+    parse_days,
+    pick_extra_days,
+)
 from bot.textfmt import format_llm, reply_long
 from bot.ui import MENU_BUTTONS, Ph, inline
 
@@ -50,7 +60,7 @@ async def apply_schedule(message: Message, user: dict, change: ScheduleChange, d
             if not fields:
                 return
         else:
-            fields.update(days=",".join(map(str, days)), days_per_week=len(days), rotation_idx=0)
+            fields.update(days=",".join(map(str, days)), days_per_week=len(days))
             old_extra = parse_days(user.get("cardio_days"))
             if old_extra:  # дни кардио не должны совпасть с новыми силовыми
                 fields["cardio_days"] = ",".join(map(str, pick_extra_days(days, len(old_extra))))
@@ -146,7 +156,7 @@ async def on_voice(message: Message, bot: Bot, db: Database, llm: LLM, settings:
     await bot.download(message.voice, destination=buf)
     try:
         text = await llm.transcribe(buf.getvalue())
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.warning("STT: %r", e)
         await message.answer("Не смог расшифровать голос. Попробуй ещё раз или напиши.")
         return

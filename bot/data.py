@@ -41,6 +41,8 @@ class Exercise:
     cues: tuple[str, ...]
     range: tuple[int, int]
     min_level: str = "new"  # "some": только тем, кто уже занимается
+    uni: bool = False  # по одной стороне: тяга одной рукой, мостик на одной ноге, растяжки «меняй ногу»
+    two_hand: bool = False  # одна гантель держится двумя руками (гоблет, французский жим): с одной гантелью не по сторонам
 
     @property
     def images(self) -> list[str]:
@@ -69,6 +71,7 @@ def exercises() -> dict[str, Exercise]:
             id=e["id"], name=e["name"], pattern=e["pattern"], equip=e["equip"],
             kind=e["kind"], step=float(e["step"]), fedb=e.get("fedb", ""), hasan=e.get("hasan"),
             cues=tuple(e["cues"]), range=rng, min_level=e.get("min_level", "new"),  # type: ignore[arg-type]
+            uni=bool(e.get("uni")), two_hand=bool(e.get("two_hand")),
         )
     return out
 
@@ -84,8 +87,9 @@ def find_exercises(query: str) -> list[Exercise]:
 
 def program_templates(days_per_week: int) -> list[dict]:
     p = _programs()
-    split = p["splits"][str(days_per_week)]
-    return p["templates"][split]
+    key = str(min(max(days_per_week or 3, 2), 4))  # вне 2–4 (старые записи) берём ближайший сплит
+    name, n = p["splits"][key]
+    return p["templates"][name][:n]
 
 
 def families() -> list[list[str]]:
@@ -124,3 +128,8 @@ def shops_data() -> dict:
 
 def flex_template() -> dict:
     return _programs()["templates"]["flex"][0]
+
+
+def is_extra_day(day_name: str) -> bool:
+    """Доп. день (кардио или гибкость): не двигает круг силовых дней A → B → C."""
+    return day_name in ("Кардио", flex_template()["name"])

@@ -1,6 +1,5 @@
 from bot.services.exercise_db import ExerciseDB, _compact
 
-
 REC = {
     "id": "0001", "name": "sled 45в° leg press", "category": "upper legs", "body_part": "upper legs",
     "equipment": "sled machine", "muscle_group": "quadriceps", "secondary_muscles": ["glutes"],

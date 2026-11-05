@@ -17,7 +17,7 @@ _FILE_IDS: dict[str, str] = {}
 async def send_animation(msg: Message, url: str) -> bool:
     try:
         sent = await msg.answer_animation(_FILE_IDS.get(url) or url)
-    except Exception as e:  # noqa: BLE001 — не критично, есть запасной вариант
+    except Exception as e:
         log.info("GIF не отправился %s: %r", url, e)
         return False
     if url not in _FILE_IDS and sent.animation:
@@ -31,7 +31,7 @@ async def send_exercise_media(msg: Message, ex: Exercise, edb: ExerciseDB) -> No
         return
     try:
         await msg.answer_media_group([InputMediaPhoto(media=u) for u in ex.images])
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         log.info("картинки не отправились %s: %r", ex.id, e)
 
 
@@ -49,14 +49,14 @@ async def send_exercise_card(msg: Message, ex: Exercise, edb: ExerciseDB, text: 
                     if gif not in _FILE_IDS and sent.animation:
                         _FILE_IDS[gif] = sent.animation.file_id
                     return
-                except Exception as e:  # noqa: BLE001 — идём к запасным картинкам
+                except Exception as e:
                     log.info("GIF с подписью не отправился %s: %r", gif, e)
             elif await send_animation(msg, gif):
                 await msg.answer(text, reply_markup=markup)
                 return
         try:
             await msg.answer_media_group([InputMediaPhoto(media=u) for u in ex.images])
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             log.info("картинки не отправились %s: %r", ex.id, e)
     await msg.answer(text, reply_markup=markup)
 

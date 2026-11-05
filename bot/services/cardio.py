@@ -38,7 +38,7 @@ def hr_zone(age: int) -> tuple[int, int]:
 def run_walk_text(n_done: int) -> str:
     run, walk, rounds = RUN_WALK[min(n_done, len(RUN_WALK) - 1)]
     total = (run + walk) * rounds
-    fmt = lambda x: f"{x:g}"  # noqa: E731
+    fmt = lambda x: f"{x:g}"
     if walk == 0:
         return f"Бегай непрерывно {fmt(run)} мин в разговорном темпе. Устал — перейди на шаг, потом снова."
     return (

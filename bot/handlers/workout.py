@@ -1,7 +1,7 @@
 """Тренировка: напоминания, карточки упражнений, ввод подходов, самочувствие (кнопкой или словами)."""
 import html
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
@@ -13,22 +13,42 @@ from bot.config import Settings
 from bot.data import PLACES, flex_template, get_exercise, warmup_data
 from bot.db.database import Database
 from bot.prompts import DEBRIEF_PROMPT, system_prompt
-from bot.services.debrief import template_debrief, workout_facts
-from bot.services.llm import LLM, LLMError
 from bot.services import cardio as cardio_svc
 from bot.services import equipment
+from bot.services.debrief import template_debrief, workout_facts
 from bot.services.goals import rest_seconds, user_goals
+from bot.services.llm import LLM, LLMError
 from bot.services.places import user_places
 from bot.services.profile import build_profile
 from bot.services.progression import FEEL_LABELS, Feel
 from bot.services.reminders import Reminders
 from bot.services.set_parser import ParsedSet, detect_feel, mentions_pain, parse_set
 from bot.services.start_weights import is_hand
-from bot.services.warmup import cooldown, ramp_line, warmup_text
+from bot.services.supp_plan import build_plan, workout_line
 from bot.services.timeutil import WEEKDAYS_RU, local_today, next_training, parse_days
-from bot.services.workout import SetOutcome, WorkoutService, describe_item
+from bot.services.warmup import cooldown, ramp_line, warmup_text
+from bot.services.workout import (
+    SIDES,
+    SetOutcome,
+    WorkoutService,
+    describe_item,
+    is_uni,
+    set_label,
+    total_steps,
+)
 from bot.textfmt import format_llm
-from bot.ui import BTN_TODAY, Ex, Fl, MENU_BUTTONS, Rem, Wk, fmt_num, inline, workout_keyboard
+from bot.ui import (
+    BTN_TODAY,
+    MENU_BUTTONS,
+    Ex,
+    Fl,
+    Rem,
+    Wk,
+    fmt_num,
+    inline,
+    main_menu,
+    workout_keyboard,
+)
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +74,7 @@ INTRO = (
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def fmt_set(kind: str, weight: float, reps: int) -> str:
@@ -70,7 +90,7 @@ def fmt_set(kind: str, weight: float, reps: int) -> str:
 # ---------- карточки ----------
 def overview_text(w: dict) -> str:
     items = "\n".join(f"• {html.escape(describe_item(i))}" for i in w["plan"])
-    minutes = sum(i["sets"] for i in w["plan"]) * 3
+    minutes = sum(total_steps(i) for i in w["plan"]) * 2 + len(w["plan"])
     return (
         f"<b>{html.escape(w['day_name'])}</b> · {PLACES[w['place']]} · ~{minutes} мин\n{items}"
     )
@@ -78,9 +98,8 @@ def overview_text(w: dict) -> str:
 
 def set_prompt(w: dict, item: dict, first: bool = False) -> str:
     """Что делать в этом подходе. first: первый заход на упражнение, показываем диапазон."""
-    n = w["set_i"] + 1
     kind = item["kind"]
-    head = f"<b>Подход {n}/{item['sets']}.</b>"
+    head = f"<b>{set_label(item, w['set_i'])}.</b>"
     if kind == "weight":
         if w["cur_weight"] is None:
             return f"{head} Подбери вес сам: лёгкий, чтобы сделать {item['hi']} повторов с запасом.\nПотом напиши «вес повторы», например <code>20 10</code>."
@@ -115,8 +134,10 @@ def exercise_text(w: dict, item: dict, ex, target, last: list[dict], extra: str 
     unit = {"weight": "повт.", "reps": "повт.", "time": "сек"}[kind]
     lines = [
         f"<b>{w['ex_i'] + 1}/{len(w['plan'])} · {html.escape(ex.name)}</b>",
-        f"{item['sets']} подх. × {item['lo']}–{item['hi']} {unit}",
+        f"{item['sets']} подх. × {item['lo']}–{item['hi']} {unit}" + (" на каждую сторону" if is_uni(item) else ""),
     ]
+    if is_uni(item):
+        lines.append("Каждый подход: сначала правая сторона, сразу за ней левая, потом отдых.")
     if last:
         lines.append("Прошлый раз: " + ", ".join(fmt_set(kind, s["weight"], s["reps"]) for s in last))
         lines.append(f"<i>{html.escape(target.note)}</i>")
@@ -143,7 +164,8 @@ async def show_exercise(msg: Message, w: dict, workouts: WorkoutService, with_me
         if w["ex_i"] == 0 and w["set_i"] == 0:
             ramp = ramp_line(w["cur_weight"], fmt_num)
         if user and ex.equip == "dumbbell" and equipment.single_dumbbell(user, w["place"]):
-            extra = "У тебя одна гантель: делай каждой рукой по очереди."
+            extra = ("У тебя одна гантель: держи её двумя руками." if ex.two_hand
+                     else "У тебя одна гантель: делай каждой рукой по очереди.")
     markup = inline([
         [("📖 Подробно", Ex(act="steps", id=ex.id)), ("📹 YouTube", ex.video_url)],
         [("🔄 Заменить", Wk(act="swap", wid=w["id"])), ("⏭ Пропустить", Wk(act="skipex", wid=w["id"]))],
@@ -174,7 +196,10 @@ async def after_outcome(
     w = await db.get_workout(wid)
     assert w
     head = (f"{logged}\n" if logged else "") + f"💬 {outcome.hint_text}"
-    if outcome.state == "next_set":
+    if outcome.state == "other_side":
+        item = w["plan"][w["ex_i"]]
+        await msg.answer(head + "\n\n" + set_prompt(w, item))
+    elif outcome.state == "next_set":
         item = w["plan"][w["ex_i"]]
         user = await db.get_user(w["tg_id"])
         if user and user.get("rest_timer", 1) and workouts.reminders and item["kind"] != "cardio":
@@ -230,9 +255,11 @@ async def finish_workout(
     nxt = next_training(parse_days(user["days"]), user["train_time"], user["tz"])
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
     vol = f"\nОбъём: {res['volume']:.0f} кг" if res["volume"] else ""
+    supp = workout_line(build_plan(user, await db.stack_list(user["tg_id"])))
     await msg.answer(
         f"✅ <b>Тренировка завершена.</b>\nПодходов: {res['sets']}, упражнений: {res['exercises']}.{vol}\n"
-        f"Серия: {res['streak']} подряд.\nСледующая: {when}."
+        f"Серия: {res['streak']} подряд.\nСледующая: {when}." + (f"\n\n{html.escape(supp)}" if supp else ""),
+        reply_markup=main_menu(),  # обновляет клавиатуру у тех, у кого ещё старое меню с «Добавками»
     )
     await send_debrief(msg, w, user, db, llm, settings)
     await send_cooldown(msg, w)
@@ -482,13 +509,15 @@ async def process_set_text(
             return True
         return False
 
+    side = f"{SIDES[w['set_i'] % 2]}: " if is_uni(item) else ""
     set_id, outcome = await workouts.log_set(w, parsed)
-    logged = f"✔ {fmt_set(item['kind'], parsed.weight, parsed.reps)}"
+    logged = f"✔ {side}{fmt_set(item['kind'], parsed.weight, parsed.reps)}"
     record = await workouts.record_note(w["tg_id"], item, parsed.weight, parsed.reps, set_id)
     if outcome is not None:
+        feel_txt = f" · {FEEL_LABELS[parsed.feel]}" if parsed.feel else ""
         await after_outcome(
             message, w["id"], outcome, db, workouts, llm, settings,
-            logged=f"{logged} · {FEEL_LABELS[parsed.feel]}" + (f"\n{record}" if record else ""),
+            logged=logged + feel_txt + (f"\n{record}" if record else ""),
         )
         return True
     fresh = await db.get_workout(w["id"])

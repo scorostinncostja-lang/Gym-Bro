@@ -2,13 +2,19 @@ import json
 
 import pytest
 
-from bot.data import EQUIPMENT_BY_PLACE, PLACES, exercises, program_templates, supplements
+from bot.data import (
+    EQUIPMENT_BY_PLACE,
+    PLACES,
+    exercises,
+    program_templates,
+    supplements,
+)
 from bot.handlers.supplements import card_text
 from bot.services import guard
 from bot.services.program_builder import alternatives, build_day, template_for
 from bot.services.progression import Feel, SetResult, next_target, set_hint
 from bot.services.set_parser import parse_set
-from bot.services.timeutil import next_training, parse_tz, parse_time
+from bot.services.timeutil import next_training, parse_time, parse_tz
 
 
 # ---------- прогрессия ----------

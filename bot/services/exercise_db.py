@@ -120,7 +120,7 @@ class ExerciseDB:
                 r.raise_for_status()
                 raw = json.loads(await r.read())
             return [_compact(rec) for rec in raw if "id" in rec]
-        except Exception as e:  # noqa: BLE001 — сеть/формат: деградируем, но не падаем
+        except Exception as e:
             log.warning("Не удалось загрузить базу упражнений %s: %r", url, e)
             return None
 

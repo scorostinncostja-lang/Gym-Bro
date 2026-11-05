@@ -1,13 +1,16 @@
 """Клавиатуры, данные кнопок и мелкие форматтеры."""
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import (
-    InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 
 BTN_TODAY = "🏋️ Тренировка"
 BTN_PLAN = "📅 План"
 BTN_STATS = "📊 Прогресс"
-BTN_SUPP = "💊 Добавки"
+BTN_SUPP = "💊 Добавки"  # убрана из меню, но старые клавиатуры у людей ещё её показывают
 BTN_SETTINGS = "⚙️ Настройки"
 MENU_BUTTONS = {BTN_TODAY, BTN_PLAN, BTN_STATS, BTN_SUPP, BTN_SETTINGS}
 
@@ -52,8 +55,7 @@ def main_menu() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text=BTN_TODAY), KeyboardButton(text=BTN_PLAN)],
-            [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_SUPP)],
-            [KeyboardButton(text=BTN_SETTINGS)],
+            [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_SETTINGS)],
         ],
         resize_keyboard=True,
     )

@@ -6,11 +6,28 @@ import pytest
 from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import TelegramMethod
-from aiogram.types import CallbackQuery, Chat, Message, MessageEntity, PhotoSize, Update, User, VideoNote
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    Message,
+    MessageEntity,
+    PhotoSize,
+    Update,
+    User,
+    VideoNote,
+)
 
 from bot.config import Settings
 from bot.db.database import Database
-from bot.handlers import chat, fallback, info, onboarding, progress, supplements, workout
+from bot.handlers import (
+    chat,
+    fallback,
+    info,
+    onboarding,
+    progress,
+    supplements,
+    workout,
+)
 from bot.main import build_dispatcher
 from bot.services.exercise_db import ExerciseDB
 from bot.services.llm import LLM
@@ -217,8 +234,6 @@ async def test_owned_supplements_plan_say_what_not_to_take(rig):
     assert "Принимай" in text and "3 г в день" in text  # креатин подростку
     assert "Не принимай" in text and "Предтрен" in text  # опасное
     assert "белок за день: 100–120 г" in text.replace("\xa0", " ") or "Весь белок за день" in text
-    await c.say("/supp_time 09:30")
-    assert (await db.get_user(1))["supp_time"] == "09:30"
 
 
 async def test_supplement_buttons_toggle_and_plan(rig):
@@ -592,28 +607,20 @@ async def test_buy_flow_asks_country_then_gives_marketplaces(rig):
     assert (await db.get_user(1))["country"] == "KZ"
 
 
-async def test_supplement_reminders_split_by_time_slot(rig):
+async def test_supplements_only_in_workout_summary(rig):
+    """Отдельных напоминаний о добавках нет: строка «что принять» в итоге тренировки."""
     bot, dp, db, session = rig
     c = Chatter(bot, dp)
     await onboard(c)
-    for sid in ("creatine", "whey", "vitd"):
+    for sid in ("creatine", "whey"):
         await db.stack_add(1, sid)
     reminders = dp.workflow_data["reminders"]
-    await db.update_user(1, days="0,1,2,3,4,5,6", supp_remind=1)  # тренировка каждый день
-    await reminders.send_supp_reminder(1, "am")
-    await reminders.send_supp_reminder(1, "post")
-    texts = session.texts()
-    am = next(t for t in texts if "Добавки с едой" in t)
-    post = next(t for t in texts if "После тренировки" in t)
-    assert "Витамин D" in am and "Креатин" not in am
-    assert "Сывороточный протеин" in post and "Креатин" in post
-    await db.update_user(1, days="")
-    await reminders.send_supp_reminder(1, "am")
-    assert any("Креатин" in t for t in session.texts() if "Добавки с едой" in t)
-    jobs = [j.id for j in (await _jobs(dp))]
+    await db.update_user(1, supp_remind=1)  # старое значение из базы ничего не включает
     reminders.schedule_user(await db.get_user(1))
-    jobs = {j.id for j in reminders.scheduler.get_jobs()}
-    assert "sp:1:am" in jobs
+    assert not any(j.id.startswith("sp:") for j in reminders.scheduler.get_jobs())
+    from bot.services.supp_plan import build_plan, workout_line
+    line = workout_line(build_plan(await db.get_user(1), await db.stack_list(1)))
+    assert line and "Креатин" in line
 
 
 async def _start_workout(c, db):
@@ -808,3 +815,23 @@ async def test_voice_answers_settings_question_and_logs_sets(rig):
     await _voice(c, bot, dp, "40 10 нормально")
     assert len(await db.workout_sets(w["id"])) == 1
     assert any("🎙 40 10 нормально" in t for t in session.texts())
+
+
+async def test_one_arm_row_goes_through_both_sides_in_chat(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    w = await _start_workout(c, db)
+    plan = [{"ex_id": "db_row", "sets": 2, "lo": 8, "hi": 12, "kind": "weight", "step": 2.0, "uni": True},
+            {"ex_id": "plank", "sets": 1, "lo": 20, "hi": 60, "kind": "time", "step": 5.0}]
+    await db.update_workout(w["id"], plan=plan, ex_i=0, set_i=0)
+    await c.say("10 10")
+    assert any("левая сторона" in t for t in session.texts()[-2:])
+    rem = dp.workflow_data["reminders"]
+    assert "rest:1" not in {j.id for j in rem.scheduler.get_jobs()}  # между сторонами отдыха нет
+    await c.say("10 10 нормально")
+    assert any("Подход 2/2 · правая сторона" in t for t in session.texts()[-2:])
+    await c.say("10 10")
+    await c.say("10 10 нормально")
+    w = await db.get_workout(w["id"])
+    assert w["ex_i"] == 1 and len(await db.workout_sets(w["id"])) == 4

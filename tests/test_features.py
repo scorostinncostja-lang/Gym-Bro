@@ -99,7 +99,7 @@ def test_goal_changes_rep_ranges_and_adds_cardio_finisher():
     strength = build_day(template_for(3, 0), {**base, "goal": "strength"})
     endurance = build_day(template_for(3, 0), {**base, "goal": "endurance"})
     muscle = build_day(template_for(3, 0), {**base, "goal": "muscle"})
-    weight_sets = lambda plan: [(p.lo, p.hi) for p in plan if p.kind == "weight"]  # noqa: E731
+    weight_sets = lambda plan: [(p.lo, p.hi) for p in plan if p.kind == "weight"]
     assert weight_sets(strength)[0] == (5, 8) and weight_sets(endurance)[0] == (15, 20) and weight_sets(muscle)[0] == (8, 12)
     assert endurance[-1].kind == "cardio" and endurance[-1].lo == 15
     assert not any(p.kind == "cardio" for p in muscle)
@@ -177,7 +177,7 @@ def test_cooldown_matches_worked_muscles_and_is_limited():
 
 
 def test_ramp_line_only_for_heavy_enough_weight():
-    f = lambda x: f"{x:g}"  # noqa: E731
+    f = lambda x: f"{x:g}"
     assert ramp_line(40, f) == "Разминочные подходы: 8 × 20 кг, потом 4 × 28 кг."
     assert ramp_line(6, f) is None
 
@@ -339,13 +339,12 @@ def test_rest_time_depends_on_goal_and_feel():
 
 # ---------- надёжность ИИ ----------
 def test_cooldowns_by_error_type():
-    import asyncio as _a
 
     from bot.services.llm import cooldown_for, short_error
     quota = Exception("429 RESOURCE_EXHAUSTED quota exceeded, GenerateRequestsPerDayPerProjectPerModel")
     rpm = Exception("429 RESOURCE_EXHAUSTED {'retryDelay': '37s'}")
     assert cooldown_for(quota) == 6 * 3600 and cooldown_for(rpm) == 60
-    assert cooldown_for(_a.TimeoutError()) == 300 and cooldown_for(Exception("503 UNAVAILABLE")) == 120
+    assert cooldown_for(TimeoutError()) == 300 and cooldown_for(Exception("503 UNAVAILABLE")) == 120
     assert short_error(quota) == "лимит бесплатной квоты"
 
 
@@ -439,17 +438,40 @@ async def test_cardio_never_counts_as_lifted_weight_and_pending_set_is_kept():
 
 
 def test_cooldown_grows_with_consecutive_failures_and_resets_on_success():
-    import asyncio as _a
     import time as _t
 
     from bot.config import Settings
     from bot.services.llm import LLM
     llm = LLM(Settings(_env_file=None, bot_token="x"))
     t0 = _t.monotonic()
-    llm._fail("m", _a.TimeoutError(), t0)
+    llm._fail("m", TimeoutError(), t0)
     first = llm.health("m").until - _t.monotonic()
-    llm._fail("m", _a.TimeoutError(), t0)
+    llm._fail("m", TimeoutError(), t0)
     second = llm.health("m").until - _t.monotonic()
     assert 290 < first <= 300 and 590 < second <= 600
     llm._ok("m", t0)
     assert llm.health("m").until == 0 and llm.health("m").streak == 0
+
+
+def test_exercises_change_every_block_but_main_lift_stays_loaded():
+    from bot.services.program_builder import build_cycle
+
+    user = {"place": "gym", "level": "new", "age": 25, "goal": "muscle", "days_per_week": 3}
+    first = [{i.ex_id for i in p} for _, p in build_cycle(user, block=0)]
+    second = [{i.ex_id for i in p} for _, p in build_cycle(user, block=1)]
+    assert first != second
+    # упражнение с весом не заменяется на упражнение без веса
+    for _, plan in build_cycle(user, block=1):
+        assert exercises()[plan[0].ex_id].kind == "weight"
+
+
+def test_single_dumbbell_makes_one_arm_work_by_sides():
+    from bot.services.equipment import dump_gear, parse_gear_text
+    from bot.services.program_builder import build_cycle
+
+    items, _ = parse_gear_text("одна гантель 5 кг, турник")
+    user = {"place": "home_db", "level": "new", "age": 25, "goal": "muscle", "days_per_week": 3,
+            "equipment": dump_gear({"items": items, "other": []})}
+    plan = {i.ex_id: i for _, p in build_cycle(user) for i in p}
+    assert plan["goblet_squat"].uni is False  # гантель двумя руками
+    assert plan["db_bench_press"].uni is True  # одной гантелью жмут по очереди

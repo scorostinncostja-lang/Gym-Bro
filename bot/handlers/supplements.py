@@ -5,7 +5,7 @@ import logging
 import re
 
 from aiogram import F, Router
-from aiogram.filters import Command, CommandObject
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -17,13 +17,18 @@ from bot.prompts import LABEL_PROMPT, SUPP_COMMENT_PROMPT, system_prompt
 from bot.services.guard import MINOR_AGE
 from bot.services.llm import LLM, LLMError, Media
 from bot.services.location import country_of, parse_location
-from bot.services.supp_label import evaluate, merge_labels, parse_label_json, render, render_price
-from bot.services.supp_shop import TIERS, buyable_for, recommend
 from bot.services.profile import build_profile
 from bot.services.reminders import Reminders
 from bot.services.supp_advice import TEEN_FOOTER
+from bot.services.supp_label import (
+    evaluate,
+    merge_labels,
+    parse_label_json,
+    render,
+    render_price,
+)
 from bot.services.supp_plan import build_plan, plan_facts, render_plan
-from bot.services.timeutil import parse_time
+from bot.services.supp_shop import TIERS, buyable_for, recommend
 from bot.textfmt import format_llm, reply_long
 from bot.ui import BTN_SUPP, Sup, inline
 
@@ -46,7 +51,8 @@ MAIN_TEXT = (
     "честно скажу, если что-то не так, и посчитаю дозу под твой вес.\n"
     "• <b>Только планируешь:</b> подскажу, что искать, какие бренды-ориентиры и где заказать у тебя в стране: "
     "бюджетно, подходящее или лучшее.\n"
-    "• <b>План приёма:</b> сколько, когда и во сколько, по твоему весу и цели.\n\n"
+    "• <b>План приёма:</b> сколько и когда, по твоему весу и цели. Отдельно не напоминаю: "
+    "что принять, напишу одной строкой в итоге тренировки.\n\n"
     "Порядок важности: еда → сон → прогрессия нагрузки → и только потом добавки."
 )
 LEGEND = (
@@ -152,7 +158,7 @@ async def send_plan(
     if jars:
         text += "\n\n📦 <b>Твои банки</b>\n" + "\n".join(jars)
     kb = inline([
-        [("✏️ Изменить набор", Sup(act="own")), ("🔔 Напоминания", Sup(act="remind"))],
+        [("✏️ Изменить набор", Sup(act="own"))],
         [("📸 Проверить банку по фото", Sup(act="have"))],
     ]) if plan.lines else main_keyboard()
     await reply_long(message, text, kb)
@@ -280,38 +286,6 @@ async def on_plan(cb: CallbackQuery, db: Database, llm: LLM, settings: Settings)
 @router.message(Command("stack"))
 async def cmd_stack(message: Message, db: Database, llm: LLM, settings: Settings):
     await _plan_for(message, message.from_user.id, db, llm, settings)
-
-
-@router.callback_query(Sup.filter(F.act == "remind"))
-async def on_remind_toggle(cb: CallbackQuery, db: Database, reminders: Reminders):
-    user = await db.get_user(cb.from_user.id)
-    if not user or not user["onboarded"]:
-        await cb.answer("Сначала анкета: /start", show_alert=True)
-        return
-    new = 0 if user["supp_remind"] else 1
-    await db.update_user(cb.from_user.id, supp_remind=new)
-    reminders.schedule_user((await db.get_user(cb.from_user.id)))  # type: ignore[arg-type]
-    await cb.answer("Включил ежедневное напоминание" if new else "Выключил")
-    if new:
-        await cb.message.answer(
-            f"Напомню в {user['supp_time']} каждый день, что принять. Время: <code>/supp_time 09:00</code>"
-        )
-
-
-@router.message(Command("supp_time"))
-async def cmd_supp_time(message: Message, command: CommandObject, db: Database, reminders: Reminders):
-    user = await db.get_user(message.from_user.id)
-    if not user or not user["onboarded"]:
-        await message.answer("Сначала анкета: /start")
-        return
-    t = parse_time(command.args or "")
-    if not t:
-        await message.answer("Формат: <code>/supp_time 09:00</code>")
-        return
-    await db.update_user(message.from_user.id, supp_time=t)
-    reminders.schedule_user((await db.get_user(message.from_user.id)))  # type: ignore[arg-type]
-    await message.answer(f"Время напоминания: {t}.")
-
 
 
 # ---------- уже купил: проверка по фото ----------
@@ -546,7 +520,7 @@ async def on_buy_location(message: Message, state: FSMContext, db: Database, rem
 
 
 @router.callback_query(Sup.filter(F.act == "took"))
-async def on_took(cb: CallbackQuery):
+async def on_took(cb: CallbackQuery):  # кнопка из старых напоминаний о добавках
     await cb.answer("Отлично 💪")
     await cb.message.edit_reply_markup(reply_markup=None)
 

@@ -9,17 +9,30 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
 
 from bot.data import PLACES, equipment_catalog, goals_data
-from bot.photo_guide import ASK_METHOD, GUIDE, SHOT_NAMES, SHOTS, next_shot_text
 from bot.db.database import Database
+from bot.photo_guide import ASK_METHOD, GUIDE, SHOT_NAMES, SHOTS, next_shot_text
 from bot.services import goals as goals_svc
-from bot.services.equipment import dump_gear, empty_gear, load_gear, merge_gear, parse_gear_text, render_gear
+from bot.services.equipment import (
+    dump_gear,
+    empty_gear,
+    load_gear,
+    merge_gear,
+    parse_gear_text,
+    render_gear,
+)
 from bot.services.llm import LLM
 from bot.services.location import COUNTRY_NAME, Location, parse_location
 from bot.services.places import ORDER, places_label, primary_place, user_places
-from bot.services.program_builder import template_for, build_day
+from bot.services.program_builder import planned_day
 from bot.services.reminders import Reminders
 from bot.services.timeutil import (
-    WEEKDAYS_RU, fmt_days, local_today, next_training, parse_days, parse_time, pick_extra_days,
+    WEEKDAYS_RU,
+    fmt_days,
+    local_today,
+    next_training,
+    parse_days,
+    parse_time,
+    pick_extra_days,
 )
 from bot.services.workout import WorkoutService, describe_item
 from bot.ui import Ob, St, inline, main_menu
@@ -78,7 +91,7 @@ async def cmd_start(message: Message, state: FSMContext, db: Database):
     user = await db.ensure_user(message.from_user.id, message.from_user.first_name)
     if user["onboarded"]:
         await message.answer(
-            "Ты уже в системе. Кнопки внизу: тренировка, план, прогресс, добавки, настройки. "
+            "Ты уже в системе. Кнопки внизу: тренировка, план, прогресс, настройки. "
             "Помощь: /help",
             reply_markup=main_menu(),
         )
@@ -708,7 +721,7 @@ async def on_days_done(cb: CallbackQuery, state: FSMContext):
     days = sorted(data["days"])
     await cb.message.edit_text(f"Дни: {fmt_days(days)}")
     warn = ""
-    if data["days_per_week"] >= 3 and any(b - a == 1 for a, b in zip(days, days[1:])):
+    if data["days_per_week"] >= 3 and any(b - a == 1 for a, b in zip(days, days[1:], strict=False)):
         warn = "\nДва дня подряд — тяжелее восстановиться, но можно."
     await state.set_state(Onb.time)
     await cb.message.answer(
@@ -777,9 +790,9 @@ async def _save_schedule(message: Message, state: FSMContext, db: Database, rem:
     fields: dict = {"cardio_days": ",".join(map(str, data.get("cardio_days", [])))}
     if data["mode"] == "sched":
         fields.update(days_per_week=data["days_per_week"], days=",".join(map(str, data["days"])),
-                      train_time=data["train_time"], rotation_idx=0)
+                      train_time=data["train_time"])
     await db.update_user(uid, **fields)
-    rem.schedule_user((await db.get_user(uid)))  # type: ignore[arg-type]
+    rem.schedule_user(await db.get_user(uid))  # type: ignore[arg-type]
     await state.clear()
     await message.answer("Расписание обновлено. Напомню вовремя.", reply_markup=main_menu())
 
@@ -806,7 +819,7 @@ async def _after_loc(message: Message, state: FSMContext, loc: Location, db: Dat
     await state.update_data(tz=loc.tz, country=loc.country, city=loc.city)
     if data["mode"] == "tz":
         await db.update_user(message.chat.id, tz=loc.tz, country=loc.country, city=loc.city)
-        rem.schedule_user((await db.get_user(message.chat.id)))  # type: ignore[arg-type]
+        rem.schedule_user(await db.get_user(message.chat.id))  # type: ignore[arg-type]
         await state.clear()
         where = ", ".join(x for x in (loc.city, COUNTRY_NAME.get(loc.country or "")) if x)
         await message.answer(f"Записал: {where or loc.tz}. Пояс: {loc.tz}.", reply_markup=main_menu())
@@ -875,7 +888,7 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
         cardio_days=",".join(map(str, data.get("cardio_days", []))),
         city=data.get("city"), country=data.get("country"),
         days_per_week=data["days_per_week"],
-        days=",".join(map(str, days)), train_time=data["train_time"], tz=tz, rotation_idx=0, onboarded=1,
+        days=",".join(map(str, days)), train_time=data["train_time"], tz=tz, onboarded=1,
     )
     today = local_today(tz).isoformat()
     await db.add_measurements(tg_id, {"weight": data["weight"], **data["m_vals"]}, today)
@@ -886,8 +899,7 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     rem.schedule_user(user)
     await state.clear()
 
-    tpl = template_for(user["days_per_week"], 0)
-    plan = build_day(tpl, user)
+    first_name, plan = planned_day(user)
     nxt = next_training(days, user["train_time"], tz)
     when = f"{WEEKDAYS_RU[nxt.weekday()]} {nxt:%d.%m} в {nxt:%H:%M}" if nxt else "—"
     items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in plan)
@@ -897,7 +909,7 @@ async def _finalize(message: Message, state: FSMContext, tz: str, db: Database, 
     await message.answer(
         f"Готово. Цели: {goals_svc.goals_label(goals_svc.user_goals(user))}. Программа: {user['days_per_week']} трен./нед "
         f"({fmt_days(days)} в {user['train_time']}), {places_label(user_places(user))}.{extra_line}\n\n"
-        f"<b>Первая тренировка — {html.escape(tpl['name'])}</b>\n{items}\n\n"
+        f"<b>Первая тренировка — {html.escape(first_name)}</b>\n{items}\n\n"
         f"Напомню: {when}. Хочешь начать раньше — кнопка «Тренировка».\n"
         "Перед каждой тренировкой я дам разминку, после неё растяжку. Вес на первое упражнение подскажу сам.",
         reply_markup=main_menu(),

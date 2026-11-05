@@ -185,17 +185,12 @@ def plan_facts(plan: Plan) -> str:
     return "\n".join(rows)
 
 
-def slot_lines(plan: Plan, slot: str, trains_today: bool) -> list[str]:
-    """Что принять в этот момент: утро с едой, перед тренировкой, после неё."""
-    out = []
-    for ln in plan.lines:
-        if ln.status not in ("take", "maybe"):
-            continue
-        short = f"{ln.name}: {ln.dose}"
-        if slot == "am" and (ln.sid in ("multivit", "vitd", "omega3") or (ln.sid == "creatine" and not trains_today)):
-            out.append(short)
-        elif slot == "pre" and ln.sid == "caffeine":
-            out.append(short)
-        elif slot == "post" and ln.sid in ("whey", "creatine"):
-            out.append(short)
-    return out
+def workout_line(plan: Plan) -> str | None:
+    """Одна строка в итог тренировки: что из своих добавок принять. Отдельных напоминаний нет.
+
+    Креатин и протеин раз в день, время не важно, поэтому хватает строки после тренировки.
+    Кофеин и предтрен сюда не попадают: после тренировки они не нужны.
+    """
+    items = [f"{ln.name.split(' (')[0]} {ln.dose}" for ln in plan.lines
+             if ln.status in ("take", "maybe") and ln.sid not in ("caffeine", "preworkout") and ln.dose]
+    return "💊 Не забудь: " + "; ".join(items) if items else None

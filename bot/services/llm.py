@@ -81,7 +81,7 @@ def shrink_image(data: bytes, side: int = GROQ_IMAGE_SIDE) -> bytes:
         out = io.BytesIO()
         im.convert("RGB").save(out, "JPEG", quality=82)
         return out.getvalue()
-    except Exception:  # noqa: BLE001
+    except Exception:
         return data
 
 
@@ -170,7 +170,7 @@ class LLM:
                 text = await asyncio.wait_for(
                     self._gemini(model, system, history, user_text, medias, max_tokens), timeout
                 )
-            except Exception as e:  # noqa: BLE001 — любой сбой модели = пробуем следующую
+            except Exception as e:
                 log.warning("Gemini %s: %s", model, short_error(e))
                 self._fail(model, e, started)
                 errors.append(f"{model}: {short_error(e)}")
@@ -190,7 +190,7 @@ class LLM:
                 )
                 self._ok("groq", started)
                 return text
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 log.warning("Groq: %s", short_error(e))
                 self._fail("groq", e, started)
                 errors.append(f"groq: {short_error(e)}")
@@ -275,7 +275,7 @@ class LLM:
                 await asyncio.wait_for(self._gemini(model, "Отвечай одним словом.", [], "Скажи: ок", [], 20),
                                        GEMINI_TIMEOUT_TEXT)
                 self._ok(model, started)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._fail(model, e, started)
             h = self.health(model)
             return model, bool(h.ok), h.ms, h.err
@@ -285,7 +285,7 @@ class LLM:
             try:
                 await asyncio.wait_for(self._groq("Отвечай одним словом.", [], "Скажи: ок", [], 20, 0), TIMEOUT)
                 self._ok("groq", started)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 self._fail("groq", e, started)
             h = self.health("groq")
             return f"Groq ({self.s.groq_llm_model if self.s.groq_llm_model not in self._st.dead_groq else DEFAULT_GROQ_LLM})", bool(h.ok), h.ms, h.err

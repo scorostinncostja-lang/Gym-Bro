@@ -2,12 +2,11 @@
 import html
 import time
 from datetime import timedelta
+from urllib.parse import quote_plus
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
-from urllib.parse import quote_plus
-
 from aiogram.types import CallbackQuery, Message
 
 from bot.cards import send_animation, send_exercise_media, steps_text
@@ -15,17 +14,22 @@ from bot.config import Settings
 from bot.data import find_exercises, get_exercise
 from bot.db.database import Database
 from bot.handlers.onboarding import MEASURE_LABELS, MEASURE_UNITS
-from bot.data import program_templates
-from bot.services.exercise_db import ExerciseDB
-from bot.services.llm import LLM
-from bot.services.report import weekly_text
 from bot.services.equipment import item_label, load_gear
+from bot.services.exercise_db import ExerciseDB
 from bot.services.goals import goals_label, user_goals
+from bot.services.llm import LLM
 from bot.services.location import COUNTRY_NAME
 from bot.services.places import places_label, user_places
-from bot.services.program_builder import build_day, build_extra_day
+from bot.services.program_builder import BLOCK_WEEKS, build_cycle, build_extra_day
 from bot.services.reminders import Reminders
-from bot.services.timeutil import WEEKDAYS_RU, fmt_days, local_today, next_training, parse_days
+from bot.services.report import weekly_text
+from bot.services.timeutil import (
+    WEEKDAYS_RU,
+    fmt_days,
+    local_today,
+    next_training,
+    parse_days,
+)
 from bot.services.workout import describe_item
 from bot.sources import ATTRIBUTION
 from bot.textfmt import reply_long
@@ -151,9 +155,12 @@ async def cmd_plan(message: Message, db: Database):
         return
     days = parse_days(user["days"])
     blocks = []
-    for tpl in program_templates(user["days_per_week"]):
-        items = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in build_day(tpl, user))
-        blocks.append(f"<b>{html.escape(tpl['name'])}</b>\n{items}")
+    cycle = build_cycle(user)
+    nxt_name = cycle[int(user.get("rotation_idx") or 0) % len(cycle)][0]
+    for day_name, plan in cycle:
+        lines = "\n".join(f"• {html.escape(describe_item(i.to_dict()))}" for i in plan)
+        mark = " ← следующая" if day_name == nxt_name else ""
+        blocks.append(f"<b>{html.escape(day_name)}</b>{mark}\n{lines}")
     extra = parse_days(user.get("cardio_days"))
     if extra:
         name, items = build_extra_day(user)
@@ -166,8 +173,9 @@ async def cmd_plan(message: Message, db: Database):
         f"🎯 {goals_label(user_goals(user))}\n"
         f"{places_label(user_places(user))} · {fmt_days(days)} в {user['train_time']}\n"
         f"Ближайшая тренировка: {when}\n\n" + "\n\n".join(blocks)
-        + "\n\nСиловые дни чередуются по кругу. Перед каждой тренировкой разминка, после неё растяжка. "
-        "Веса подбираются автоматически по твоим результатам.",
+        + f"\n\nСиловые дни идут по кругу и не повторяют друг друга. Каждые {BLOCK_WEEKS} недели упражнения "
+        "меняются на равноценные: веса успевают вырасти, а мышцы получают новый стимул. "
+        "Перед тренировкой разминка, после неё растяжка. Веса подбираются по твоим результатам.",
     )
 
 

@@ -2,23 +2,50 @@
 from dataclasses import dataclass
 from datetime import date
 
-from bot.data import get_exercise
+from bot.data import get_exercise, is_extra_day
 from bot.db.database import Database
-from bot.services.exercise_db import ExerciseDB
-from bot.data import flex_template
 from bot.services import equipment
+from bot.services.exercise_db import ExerciseDB
 from bot.services.goals import user_goals
-from bot.services.program_builder import alternatives, build_day, build_extra_day, make_item, template_for
+from bot.services.program_builder import (
+    alternatives,
+    build_extra_day,
+    is_unilateral,
+    make_item,
+    planned_day,
+)
 from bot.services.progression import Feel, SetResult, Target, next_target, set_hint
+from bot.services.set_parser import ParsedSet
 from bot.services.start_weights import start_weight
 from bot.services.timeutil import local_today, parse_days
-from bot.services.set_parser import ParsedSet
+
+SIDES = ("правая", "левая")
+
+
+def is_uni(item: dict) -> bool:
+    """Упражнение по сторонам. Старые планы без поля uni берут его из справочника."""
+    if "uni" in item:
+        return bool(item["uni"])
+    ex = get_exercise(item["ex_id"])
+    return bool(ex and ex.uni)
+
+
+def total_steps(item: dict) -> int:
+    """Сколько раз вводить результат: у одностороннего упражнения каждая сторона отдельно."""
+    return item["sets"] * (2 if is_uni(item) else 1)
+
+
+def set_label(item: dict, set_i: int) -> str:
+    """«Подход 2/3» или «Подход 2/3 · левая сторона»."""
+    if not is_uni(item):
+        return f"Подход {set_i + 1}/{item['sets']}"
+    return f"Подход {set_i // 2 + 1}/{item['sets']} · {SIDES[set_i % 2]} сторона"
 
 
 @dataclass
 class SetOutcome:
     hint_text: str
-    state: str  # next_set | next_ex | finished
+    state: str  # next_set | other_side | next_ex | finished
     feel: int | None = None
 
 
@@ -34,13 +61,14 @@ class WorkoutService:
         existing = await self.db.workout_on(tg_id, day.isoformat())
         if existing and existing["status"] in ("planned", "active", "done", "skipped"):
             return existing
-        await self.db.mark_missed(tg_id, day.isoformat())
+        moved = await self.db.mark_missed(tg_id, day.isoformat())
+        if moved:  # закрыли брошенную вчерашнюю тренировку: круг дней сдвинулся
+            user = {**user, "rotation_idx": int(user["rotation_idx"]) + moved}
         wd = day.weekday()
         if wd in parse_days(user.get("cardio_days")) and wd not in parse_days(user["days"]):
             name, items = build_extra_day(user, user["place"], index=await self.db.done_count(tg_id))
         else:
-            tpl = template_for(user["days_per_week"], user["rotation_idx"])
-            name, items = tpl["name"], build_day(tpl, user)
+            name, items = planned_day(user)
         wid = await self.db.create_workout(tg_id, day.isoformat(), name, user["place"], [i.to_dict() for i in items])
         w = await self.db.get_workout(wid)
         assert w
@@ -50,11 +78,10 @@ class WorkoutService:
         """«Сегодня не могу в зал»: тот же день, но под другое место и инвентарь."""
         w = await self.db.get_workout(workout_id)
         assert w and w["status"] == "planned"
-        if w["day_name"] == "Кардио" or w["day_name"] == flex_template()["name"]:
-            name, items = build_extra_day(user, place, index=await self.db.done_count(user["tg_id"]))
+        if is_extra_day(w["day_name"]):
+            _, items = build_extra_day(user, place, index=await self.db.done_count(user["tg_id"]))
         else:
-            tpl = template_for(user["days_per_week"], user["rotation_idx"])
-            items = build_day(tpl, user, place)
+            _, items = planned_day(user, place)
         await self.db.update_workout(workout_id, plan=[i.to_dict() for i in items], place=place)
         w = await self.db.get_workout(workout_id)
         assert w
@@ -116,6 +143,10 @@ class WorkoutService:
             w["id"], w["tg_id"], item["ex_id"], w["set_i"] + 1, parsed.weight, parsed.reps,
             int(parsed.feel) if parsed.feel else None,
         )
+        if is_uni(item) and w["set_i"] % 2 == 0:
+            # Первая сторона: «как далось» спросим после второй и запишем обеим. Вес тот же, без отдыха.
+            await self.db.update_workout(w["id"], set_i=w["set_i"] + 1, pend_set_id=None, cur_reps=parsed.reps)
+            return set_id, SetOutcome("Теперь вторая сторона: тот же вес и столько же повторов.", "other_side")
         if parsed.feel:
             return set_id, await self.complete_set(w["id"], set_id, parsed.feel)
         await self.db.update_workout(w["id"], pend_set_id=set_id)
@@ -128,7 +159,7 @@ class WorkoutService:
             return None  # первый раз — не рекорд, а старт
         ex = get_exercise(item["ex_id"])
         name = ex.name if ex else item["ex_id"]
-        fmt = lambda x: f"{x:g}"  # noqa: E731
+        fmt = lambda x: f"{x:g}"
         if item["kind"] == "weight" and weight > (prev["w"] or 0):
             return f"🏆 Рекорд в «{name}»: {fmt(weight)} кг (было {fmt(prev['w'] or 0)})!"
         if item["kind"] in ("reps", "time", "cardio") and reps > (prev["r"] or 0):
@@ -142,6 +173,7 @@ class WorkoutService:
         assert w and s
         item = w["plan"][w["ex_i"]]
         await self.db.set_feel(set_id, int(feel))
+        await self.db.fill_feel(workout_id, int(feel))  # первая сторона одностороннего подхода
         calibrating = not await self.db.last_sets(w["tg_id"], item["ex_id"], exclude_workout=workout_id)
         ladder = self._ladder(await self.db.get_user(w["tg_id"]), w["place"], item["ex_id"])
         hint = set_hint(
@@ -150,7 +182,7 @@ class WorkoutService:
         )
 
         set_i = w["set_i"] + 1
-        if set_i < item["sets"]:
+        if set_i < total_steps(item):
             await self.db.update_workout(
                 workout_id, set_i=set_i, pend_set_id=None,
                 cur_weight=hint.next_weight if hint.next_weight is not None else w["cur_weight"],
@@ -167,6 +199,7 @@ class WorkoutService:
         if w.get("pend_set_id"):
             await self.db.set_feel(w["pend_set_id"], int(Feel.OK))
             await self.db.update_workout(w["id"], pend_set_id=None)
+        await self.db.fill_feel(w["id"], int(Feel.OK))
 
     async def _next_exercise(self, workout_id: int) -> str:
         w = await self.db.get_workout(workout_id)
@@ -189,11 +222,15 @@ class WorkoutService:
         item = w["plan"][w["ex_i"]]
         taken = {i["ex_id"] for i in w["plan"]}
         user = await self.db.get_user(w["tg_id"])
-        alts = alternatives(item["ex_id"], user, w["place"], taken) if user else []
+        if not user:
+            return False
+        alts = alternatives(item["ex_id"], user, w["place"], taken)
         if not alts:
             return False
         ex = alts[0]
-        w["plan"][w["ex_i"]] = make_item(ex, item["sets"], user_goals(user), user.get("age")).to_dict()
+        w["plan"][w["ex_i"]] = make_item(
+            ex, item["sets"], user_goals(user), user.get("age"), uni=is_unilateral(ex, user, w["place"]),
+        ).to_dict()
         await self.db.update_workout(workout_id, plan=w["plan"])
         await self.enter_exercise(workout_id)
         return True
@@ -206,7 +243,7 @@ class WorkoutService:
         sets = await self.db.workout_sets(workout_id)
         await self.db.update_workout(workout_id, status="done" if sets else "skipped", finished_at=now_iso)
         if sets:
-            if w["day_name"] not in ("Кардио", flex_template()["name"]):
+            if not is_extra_day(w["day_name"]):
                 await self.db.update_user(user["tg_id"], rotation_idx=user["rotation_idx"] + 1)
         volume = sum(s["weight"] * s["reps"] for s in sets if (e := get_exercise(s["ex_id"])) and e.kind == "weight")
         exercises = {s["ex_id"] for s in sets}
@@ -222,4 +259,5 @@ def describe_item(item: dict) -> str:
     if item["kind"] == "cardio":
         return f"{name}: {item['lo']} мин"
     unit = {"weight": "повт.", "reps": "повт.", "time": "сек"}[item["kind"]]
-    return f"{name}: {item['sets']} × {item['lo']}–{item['hi']} {unit}"
+    side = " на каждую сторону" if is_uni(item) else ""
+    return f"{name}: {item['sets']} × {item['lo']}–{item['hi']} {unit}{side}"

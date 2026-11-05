@@ -1,10 +1,12 @@
 """SQLite-хранилище. Тонкая обёртка над aiosqlite без ORM."""
 import json
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+from bot.data import is_extra_day
 
 STALE_WORKOUT_HOURS = 8
 
@@ -128,7 +130,7 @@ _TABLES_BY_USER = ("measurements", "workouts", "sets", "usage", "stack", "chat",
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 class Database:
@@ -329,14 +331,19 @@ class Database:
             started = datetime.fromisoformat(w["started_at"])
         except (TypeError, ValueError):
             return False
-        return datetime.now(timezone.utc) - started > timedelta(hours=STALE_WORKOUT_HOURS)
+        return datetime.now(UTC) - started > timedelta(hours=STALE_WORKOUT_HOURS)
 
-    async def _close_stale(self, w: dict) -> None:
+    async def _close_stale(self, w: dict) -> bool:
+        """Брошенная тренировка: с подходами засчитываем, без подходов — пропуск. True = круг дней сдвинут."""
         if await self.workout_sets(w["id"]):
+            await self.fill_feel(w["id"], 2)  # Feel.OK: подходы без оценки иначе выпадут из истории
             await self.update_workout(w["id"], status="done", finished_at=w["started_at"])
-            await self._exec("UPDATE users SET rotation_idx=rotation_idx+1 WHERE tg_id=?", (w["tg_id"],))
+            if not is_extra_day(w["day_name"]):
+                await self._exec("UPDATE users SET rotation_idx=rotation_idx+1 WHERE tg_id=?", (w["tg_id"],))
+                return True
         else:
             await self.update_workout(w["id"], status="missed")
+        return False
 
     async def workout_on(self, tg_id: int, day: str) -> dict | None:
         w = await self._one(
@@ -346,12 +353,22 @@ class Database:
             w["plan"] = json.loads(w["plan"])
         return w
 
-    async def mark_missed(self, tg_id: int, before_day: str) -> None:
-        """Тренировки, на которые не ответили, помечаются пропущенными."""
+    async def mark_missed(self, tg_id: int, before_day: str) -> int:
+        """Тренировки прошлых дней: начатые закрываем (с подходами — засчитаны), остальные — пропуск.
+
+        Иначе тренировку, где человек не нажал «Закончить», напоминание следующего дня считало
+        пропущенной, круг не сдвигался и снова выдавался тот же день.
+        """
+        moved = 0
+        for w in await self._all(
+            "SELECT * FROM workouts WHERE tg_id=? AND status='active' AND day<?", (tg_id, before_day)
+        ):
+            moved += await self._close_stale(w)
         await self._exec(
             "UPDATE workouts SET status='missed' WHERE tg_id=? AND status IN ('planned','active') AND day<?",
             (tg_id, before_day),
         )
+        return moved
 
     async def next_planned_workout(self, tg_id: int) -> dict | None:
         return await self._one(
@@ -369,6 +386,10 @@ class Database:
 
     async def set_feel(self, set_id: int, feel: int) -> None:
         await self._exec("UPDATE sets SET feel=? WHERE id=?", (feel, set_id))
+
+    async def fill_feel(self, workout_id: int, feel: int) -> None:
+        """Подходы тренировки без оценки (первая сторона одностороннего) получают эту оценку."""
+        await self._exec("UPDATE sets SET feel=? WHERE workout_id=? AND feel IS NULL", (feel, workout_id))
 
     async def get_set(self, set_id: int) -> dict | None:
         return await self._one("SELECT * FROM sets WHERE id=?", (set_id,))

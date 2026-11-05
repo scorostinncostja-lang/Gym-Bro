@@ -10,12 +10,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 
 from bot.db.database import Database
-from bot.services.supp_plan import build_plan, slot_lines
-from bot.services.timeutil import local_today, parse_days, shift_time
-from bot.services.workout import WorkoutService
 from bot.services.places import user_places
 from bot.services.report import weekly_text
-from bot.ui import Sup, inline, workout_keyboard
+from bot.services.timeutil import local_today, parse_days
+from bot.services.workout import WorkoutService, set_label
+from bot.ui import workout_keyboard
 
 log = logging.getLogger(__name__)
 
@@ -65,8 +64,6 @@ class Reminders:
                     args=[tg_id], id=f"wk:{tg_id}:{name}", misfire_grace_time=600, coalesce=True,
                     replace_existing=True,
                 )
-        if user.get("supp_remind") and tz:
-            self._schedule_supp(user, days, ZoneInfo(tz))
         self._remove(f"wr:{tg_id}")
         if tz and user.get("onboarded"):
             self.scheduler.add_job(
@@ -74,26 +71,6 @@ class Reminders:
                 args=[tg_id], id=f"wr:{tg_id}", misfire_grace_time=3600, coalesce=True, replace_existing=True,
             )
 
-    def _schedule_supp(self, user: dict, days: list[int], tz: ZoneInfo) -> None:
-        """Добавки напоминаются в нужный момент: утром, перед тренировкой и после неё."""
-        tg_id = user["tg_id"]
-        h, m = map(int, user["supp_time"].split(":"))
-        self.scheduler.add_job(
-            self.send_supp_reminder, CronTrigger(hour=h, minute=m, timezone=tz), args=[tg_id, "am"],
-            id=f"sp:{tg_id}:am", misfire_grace_time=900, coalesce=True, replace_existing=True,
-        )
-        if user.get("train_time") and days:
-            for slot, shift in (("pre", -45), ("post", 75)):
-                t = shift_time(user["train_time"], shift)
-                th, tm = map(int, t.split(":"))
-                self.scheduler.add_job(
-                    self.send_supp_reminder, CronTrigger(
-                        day_of_week=",".join(map(str, days)), hour=th, minute=tm, timezone=tz),
-                    args=[tg_id, slot], id=f"sp:{tg_id}:{slot}", misfire_grace_time=900, coalesce=True,
-                    replace_existing=True,
-                )
-
-    # ---------- таймер отдыха ----------
     def schedule_rest(self, tg_id: int, workout_id: int, ex_i: int, set_i: int, seconds: int) -> None:
         when = datetime.now(ZoneInfo("UTC")) + timedelta(seconds=seconds)
         self.scheduler.add_job(
@@ -113,7 +90,7 @@ class Reminders:
             goal = f"{w['cur_weight']:g} кг × {w['cur_reps']}"
         else:
             goal = f"{w['cur_reps']} {'сек' if item['kind'] == 'time' else 'повт.'}"
-        await self._safe_send(tg_id, f"⏰ Отдых {seconds} сек прошёл. Подход {set_i + 1}/{item['sets']}: {goal}.")
+        await self._safe_send(tg_id, f"⏰ Отдых {seconds} сек прошёл. {set_label(item, set_i)}: {goal}.")
 
     # ---------- недельный отчёт ----------
     async def send_weekly(self, tg_id: int) -> None:
@@ -181,24 +158,8 @@ class Reminders:
             workout_keyboard(workout_id, user_places(user), w["place"], reminder=True),
         )
 
-    async def send_supp_reminder(self, tg_id: int, slot: str = "am") -> None:
-        user = await self.db.get_user(tg_id)
-        if not user:
-            return
-        plan = build_plan(user, await self.db.stack_list(tg_id))
-        trains_today = local_today(user["tz"]).weekday() in parse_days(user["days"])
-        lines = slot_lines(plan, slot, trains_today)
-        if not lines:
-            return
-        body = "\n".join(f"• {html.escape(x)}" for x in lines)
-        title = {"am": "💊 Добавки с едой", "pre": "💊 Перед тренировкой", "post": "💊 После тренировки"}[slot]
-        await self._safe_send(
-            tg_id, f"{title}:\n{body}\nПлан целиком: /stack",
-            inline([[("✅ Принял", Sup(act="took"))]]),
-        )
-
     async def _safe_send(self, tg_id: int, text: str, markup=None) -> None:
         try:
             await self.bot.send_message(tg_id, text, reply_markup=markup)
-        except Exception as e:  # noqa: BLE001 — пользователь мог заблокировать бота
+        except Exception as e:
             log.warning("не удалось отправить напоминание %s: %r", tg_id, e)
