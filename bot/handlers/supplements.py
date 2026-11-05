@@ -30,7 +30,7 @@ from bot.services.supp_label import (
 from bot.services.supp_plan import build_plan, plan_facts, render_plan
 from bot.services.supp_shop import TIERS, buyable_for, recommend
 from bot.textfmt import format_llm, reply_long
-from bot.ui import BTN_SUPP, Sup, inline
+from bot.ui import BTN_SUPP, Sup, inline, main_menu
 
 log = logging.getLogger(__name__)
 
@@ -184,8 +184,18 @@ async def _jar_lines(db: Database, user: dict, owned: list[str]) -> list[str]:
     return out
 
 
-@router.message(Command("supplements", "supp"))
 @router.message(F.text == BTN_SUPP)
+async def old_supp_button(message: Message):
+    """Кнопка из старого меню: Telegram держит клавиатуру, пока бот не пришлёт новую. Присылаем."""
+    await message.answer(
+        "Кнопку «Добавки» я убрал из меню, обновил клавиатуру.\n"
+        "Проверить банку: просто пришли её фото. Что принять из своих добавок, напишу в итоге тренировки. "
+        "Весь раздел: /supplements",
+        reply_markup=main_menu(),
+    )
+
+
+@router.message(Command("supplements", "supp"))
 async def cmd_supplements(message: Message, db: Database):
     user = await db.get_user(message.from_user.id)
     await message.answer(MAIN_TEXT + ("" if _is_adult(user) else MINOR_HEAD), reply_markup=main_keyboard())

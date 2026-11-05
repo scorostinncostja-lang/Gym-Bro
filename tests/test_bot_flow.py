@@ -835,3 +835,12 @@ async def test_one_arm_row_goes_through_both_sides_in_chat(rig):
     await c.say("10 10 нормально")
     w = await db.get_workout(w["id"])
     assert w["ex_i"] == 1 and len(await db.workout_sets(w["id"])) == 4
+
+
+async def test_old_supp_button_replaces_keyboard(rig):
+    bot, dp, db, session = rig
+    c = Chatter(bot, dp)
+    await onboard(c)
+    from bot.ui import BTN_SUPP
+    await c.say(BTN_SUPP)
+    assert any("убрал из меню" in t for t in session.texts()[-2:])

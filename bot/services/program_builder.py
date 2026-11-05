@@ -113,7 +113,7 @@ def build_day(
             compounds += 1
     if finisher:
         minutes = goals.finisher_minutes(goal_list)
-        if minutes and not any(i.kind == "time" for i in plan):  # у дня гибкости финишер не нужен
+        if minutes:  # день гибкости собирается с finisher=False
             fin = cardio_item(user, place, minutes, day_index + variant)
             if fin:
                 plan.append(fin)
